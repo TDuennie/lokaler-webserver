@@ -102,6 +102,45 @@ Dateien wie .sqlite, .db und .env ohnehin nie an den Browser aus,
 auch wenn sie in "www" liegen.
 
 
+MEHRERE ARBEITSPLAETZE AUF EINEM SYNC-ORDNER
+-------------------------------------------
+
+Liegt der Ordner in Nextcloud und jeder startet seinen eigenen Server,
+arbeiten alle auf denselben Dateien. Wer dabei einfach speichert,
+ueberschreibt die Aenderungen der anderen.
+
+Damit das nicht passiert, gibt es "www\lib\speicher.php". Datensaetze
+kommen dort in eine JSON-Datei, die sich zusammenfuehren laesst:
+
+  require __DIR__ . "/lib/speicher.php";
+  $speicher = new Speicher(__DIR__ . "/../daten/kunden.json");
+
+  $id = $speicher->sichern(["name" => "Anna Berger"]);
+  $alle = $speicher->alle();
+  $speicher->loeschen($id);
+
+Jeder Datensatz bekommt eine Kennung und einen Zeitstempel. Treffen zwei
+Staende aufeinander, gewinnt der juengere Datensatz - nicht die juengere
+Datei. Konfliktkopien von Nextcloud werden automatisch eingemischt.
+
+Zum Anschauen:  http://localhost:8080/beispiel.php
+
+Zwei Dinge dazu:
+
+  * Die Uhren der Rechner sollten stimmen. Geht einer nach, verlieren
+    seine Aenderungen.
+  * Bearbeiten zwei Personen gleichzeitig DENSELBEN Datensatz, setzt
+    sich die spaetere Fassung ganz durch. Verschiedene Datensaetze
+    gleichzeitig zu bearbeiten ist immer sicher.
+
+Wichtig: Datenbanken und Datendateien gehoeren nach "daten", nicht nach
+"www". Sonst kann sie jeder ueber den Browser herunterladen.
+
+SQLite ist fuer einen Sync-Ordner mit mehreren Leuten NICHT geeignet -
+die Datei kann dabei beschaedigt werden. Fuer einen einzelnen Arbeits-
+platz ist sie voellig in Ordnung.
+
+
 WAS IM ORDNER LIEGEN MUSS
 -------------------------
 

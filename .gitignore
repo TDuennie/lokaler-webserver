@@ -10,6 +10,7 @@ daten/
 *.db
 *.db3
 .env
+*.sperre
 
 # Wird beim ersten Start selbst angelegt
 einstellungen.txt

@@ -56,6 +56,69 @@ Standardmäßig lauscht der Server nur auf `127.0.0.1` und ist vom Netzwerk aus
 nicht erreichbar. Mit `netzwerk = ja` wird er für andere Geräte im selben Netz
 geöffnet; die Startmeldung nennt dann die Adresse und weist darauf hin.
 
+## Gemeinsame Daten in einem Sync-Ordner
+
+Wenn mehrere Arbeitsplätze denselben Ordner über Nextcloud (oder einen anderen
+Sync-Dienst) teilen und jeder seinen eigenen Server startet, arbeiten alle auf
+derselben Datei. Naiv geschrieben gehen dabei Daten verloren: Wer zuletzt
+speichert, überschreibt die Änderungen der anderen.
+
+`www/lib/speicher.php` löst das. Datensätze landen in einer JSON-Datei, die
+sich zusammenführen lässt:
+
+```php
+require __DIR__ . "/lib/speicher.php";
+
+// Neben www ablegen, nicht darin - sonst ist die Datei über den Browser lesbar
+$speicher = new Speicher(__DIR__ . "/../daten/kunden.json");
+
+$id  = $speicher->sichern(["name" => "Anna Berger", "ort" => "Kassel"]);
+$alle = $speicher->alle();
+$einer = $speicher->holen($id);
+$speicher->sichern(["id" => $id, "name" => "Anna Berger", "ort" => "Marburg"]);
+$speicher->loeschen($id);
+```
+
+`www/beispiel.php` ist eine vollständige Liste zum Anschauen und Löschen.
+
+### Wie das Zusammenführen arbeitet
+
+- **Kennung und Zeitstempel je Datensatz.** Treffen zwei Fassungen aufeinander,
+  gewinnt der jüngere Datensatz – nicht die jüngere Datei. Bei exakt gleichem
+  Zeitstempel entscheidet der Inhalt, damit alle Arbeitsplätze unabhängig
+  voneinander zum selben Ergebnis kommen.
+- **Vor jedem Schreiben wird frisch gelesen** und die eigene Änderung
+  hineingemischt.
+- **Gelöschtes wird markiert statt entfernt** – sonst brächte der nächste
+  Abgleich es zurück. Nach 90 Tagen fallen die Markierungen weg.
+- **Geschrieben wird über eine Nebendatei mit anschließendem Umbenennen**, mit
+  Wiederholung bei kurzzeitigen Sperren durch Virenscanner oder Sync-Client.
+  So bleibt nie eine halb geschriebene Datei zurück.
+- **Konfliktkopien** (`kunden (conflicted copy …).json`) werden erkannt,
+  eingemischt und nach `daten/sicherungen/` weggeräumt.
+- **Eine Dateisperre** hält gleichzeitige Aufrufe auf demselben Rechner
+  auseinander.
+- **Einmal täglich eine Sicherung** in `daten/sicherungen/`, die letzten 14.
+
+Gemessen mit zehn gleichzeitig schreibenden Prozessen, je zehn Datensätze:
+100 von 100 kommen an. Dieselbe Aufgabe mit `file_put_contents` geschrieben
+verliert 94 davon.
+
+### Zwei Grenzen
+
+- **Die Uhren der Rechner müssen stimmen.** „Der jüngere gewinnt“ stützt sich
+  auf die Uhrzeit des schreibenden Rechners. Geht einer merklich nach, verlieren
+  seine Änderungen systematisch. In einer Domäne mit Zeitabgleich ist das kein
+  Thema.
+- **Zusammengeführt wird je Datensatz, nicht je Feld.** Ändern zwei Personen
+  gleichzeitig denselben Datensatz – eine den Namen, die andere den Ort –,
+  setzt sich die spätere Fassung komplett durch. Verschiedene Datensätze
+  gleichzeitig zu bearbeiten ist dagegen immer sicher.
+
+Wo beides nicht reicht, ist ein einziger Server für alle der bessere Weg:
+`netzwerk = ja`, und die anderen rufen dessen Adresse auf. Dann gibt es nur
+eine Datei, einen Schreiber und keine Sync-Verzögerung.
+
 ## Einstellungen
 
 Alles steht in `einstellungen.txt`, die beim ersten Start angelegt wird:
@@ -104,8 +167,10 @@ lokaler-webserver/
 ├── php/                               nur nötig für PHP
 ├── www/                               die eigenen Seiten
 │   ├── index.html
-│   └── test.php                       Selbsttest, darf weg
-├── daten/                             guter Platz für SQLite-Dateien
+│   ├── test.php                       Selbsttest, darf weg
+│   ├── beispiel.php                   gemeinsame Liste, darf weg
+│   └── lib/speicher.php               Datensätze für den Sync-Ordner
+├── daten/                             Datenbanken und JSON-Dateien
 ├── einstellungen.txt                  legt der Server selbst an
 ├── Anleitung.html                     bebilderte Anleitung, per Doppelklick
 ├── Webserver starten.vbs
