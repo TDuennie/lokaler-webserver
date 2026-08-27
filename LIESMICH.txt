@@ -1,0 +1,94 @@
+URLAUBSKALENDER
+===============
+
+Ein kleiner Webserver, der auf jedem Arbeitsplatz einzeln laeuft.
+Alle arbeiten dabei auf derselben Datei im Drive.
+
+
+STARTEN
+-------
+
+  Doppelklick auf   "Urlaubskalender starten.vbs"
+
+Der Browser oeffnet sich von selbst mit dem Kalender.
+Es laeuft alles auf dem eigenen Rechner - es geht nichts ins Internet.
+
+Wenn etwas nicht klappt, stattdessen
+"Urlaubskalender mit Fenster starten.cmd" doppelklicken.
+Dann bleibt ein Fenster mit den Meldungen offen.
+
+
+BEENDEN
+-------
+
+  Doppelklick auf   "Urlaubskalender beenden.cmd"
+
+Oder das Fenster schliessen, falls es sichtbar gestartet wurde.
+Den Kalender einfach laufen zu lassen, ist ebenfalls in Ordnung.
+
+
+WAS IM ORDNER LIEGEN MUSS
+-------------------------
+
+  server.js       das Programm
+  node.exe        wird zum Ausfuehren gebraucht (rund 80 MB)
+  web\            die Oberflaeche
+  daten\          die gemeinsamen Daten, legt der Server selbst an
+
+  Urlaubskalender starten.vbs
+  Urlaubskalender mit Fenster starten.cmd
+  Urlaubskalender beenden.cmd
+
+Die "node.exe" muss NICHT installiert werden. Sie liegt einfach im
+Ordner mit. Fehlt sie, weisen die Startdateien darauf hin.
+
+
+ZUSAMMENARBEIT
+--------------
+
+Jeder startet seinen eigenen Kalender. Aenderungen landen in der Datei
+
+  daten\urlaubskalender-daten.json
+
+Sobald der Drive sie zu den anderen gebracht hat, aktualisieren sich
+deren Kalender von selbst - ohne dass jemand neu laden muss.
+
+Damit dabei nichts verloren geht:
+
+  * Jeder Eintrag hat eine eigene Kennung. Zwei Personen koennen
+    gleichzeitig etwas eintragen, ohne sich zu ueberschreiben.
+  * Geloeschtes wird als geloescht vermerkt, statt einfach zu
+    verschwinden. Sonst waere es beim naechsten Abgleich wieder da.
+  * Legt der Drive eine Konfliktkopie an, wird sie automatisch
+    eingelesen und nach "daten\backups" weggeraeumt.
+  * Einmal taeglich wird eine Sicherung in "daten\backups" abgelegt.
+    Die letzten 30 bleiben erhalten.
+
+
+EINSTELLUNGEN
+-------------
+
+Anderer Port:
+  Eine Datei "port.txt" anlegen und nur die Zahl hineinschreiben,
+  zum Beispiel   8090
+
+Browser soll sich nicht oeffnen:
+  Eine leere Datei "kein-browser.txt" anlegen.
+
+
+WENN ETWAS NICHT STIMMT
+-----------------------
+
+"Node.js wurde nicht gefunden"
+  Die node.exe fehlt im Ordner. Sie steckt in der ZIP-Datei
+  "Windows Binary (.zip)" auf https://nodejs.org/en/download
+  im Ordner "node-vXX-win-x64".
+
+"Der Urlaubskalender laeuft auf diesem Rechner bereits"
+  Alles in Ordnung - er wird einfach im Browser geoeffnet.
+
+Der Kalender zeigt "Nicht gefunden"
+  Der Ordner "web" fehlt.
+
+Sonstiges
+  In "daten\server-log-RECHNERNAME.txt" steht mit, was passiert ist.

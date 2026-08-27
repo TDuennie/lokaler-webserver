@@ -1,0 +1,24 @@
+# Echte Urlaubsdaten enthalten Namen von Mitarbeitern und gehoeren
+# nicht in ein Repository. Der Server legt diesen Ordner selbst an.
+daten/
+urlaubskalender-daten*.json
+server-log-*.txt
+
+# Mitgeliefertes Node.js (rund 80 MB, wird nicht versioniert)
+node.exe
+node/
+
+# Oberflaeche - liegt im Drive, wird hier bewusst nicht mitgefuehrt
+web/
+
+# Schalter fuer den Betrieb
+port.txt
+kein-browser.txt
+
+# Betriebssystem- und Sync-Artefakte
+.DS_Store
+desktop.ini
+Thumbs.db
+*.tmp
+*.sichern
+~$*
