@@ -1,94 +1,139 @@
-URLAUBSKALENDER
-===============
+LOKALER WEBSERVER
+=================
 
-Ein kleiner Webserver, der auf jedem Arbeitsplatz einzeln laeuft.
-Alle arbeiten dabei auf derselben Datei im Drive.
+Zeigt die Dateien aus dem Ordner "www" im Browser an - HTML, CSS,
+Bilder, PDF, Video, und PHP mit SQLite.
+
+Alles laeuft auf dem eigenen Rechner. Es geht nichts ins Internet.
+Der Ordner darf verschoben, kopiert oder im Drive abgelegt werden -
+der Server findet sich immer selbst.
 
 
 STARTEN
 -------
 
-  Doppelklick auf   "Urlaubskalender starten.vbs"
+  Doppelklick auf   "Webserver starten.vbs"
 
-Der Browser oeffnet sich von selbst mit dem Kalender.
-Es laeuft alles auf dem eigenen Rechner - es geht nichts ins Internet.
+Der Browser oeffnet sich von selbst.
 
-Wenn etwas nicht klappt, stattdessen
-"Urlaubskalender mit Fenster starten.cmd" doppelklicken.
-Dann bleibt ein Fenster mit den Meldungen offen.
+Klappt etwas nicht, stattdessen "Webserver mit Fenster starten.cmd"
+nehmen - dann bleibt ein Fenster mit allen Meldungen offen.
+
+Am Mac:  Doppelklick auf "Webserver starten.command"
 
 
 BEENDEN
 -------
 
-  Doppelklick auf   "Urlaubskalender beenden.cmd"
+  Doppelklick auf   "Webserver beenden.cmd"
 
-Oder das Fenster schliessen, falls es sichtbar gestartet wurde.
-Den Kalender einfach laufen zu lassen, ist ebenfalls in Ordnung.
-
-
-WAS IM ORDNER LIEGEN MUSS
--------------------------
-
-  server.js       das Programm
-  node.exe        wird zum Ausfuehren gebraucht (rund 80 MB)
-  web\            die Oberflaeche
-  daten\          die gemeinsamen Daten, legt der Server selbst an
-
-  Urlaubskalender starten.vbs
-  Urlaubskalender mit Fenster starten.cmd
-  Urlaubskalender beenden.cmd
-
-Die "node.exe" muss NICHT installiert werden. Sie liegt einfach im
-Ordner mit. Fehlt sie, weisen die Startdateien darauf hin.
+Oder das Fenster schliessen, falls sichtbar gestartet wurde.
 
 
-ZUSAMMENARBEIT
---------------
+EIGENE SEITEN
+-------------
 
-Jeder startet seinen eigenen Kalender. Aenderungen landen in der Datei
+Alles, was in den Ordner "www" kommt, ist sofort im Browser da:
 
-  daten\urlaubskalender-daten.json
+  www\index.html          ->  http://localhost:8080/
+  www\bilder\logo.png     ->  http://localhost:8080/bilder/logo.png
+  www\shop\index.php      ->  http://localhost:8080/shop/
 
-Sobald der Drive sie zu den anderen gebracht hat, aktualisieren sich
-deren Kalender von selbst - ohne dass jemand neu laden muss.
+Liegt in einem Ordner keine "index.html" (oder "index.php"), zeigt
+der Server den Ordnerinhalt als Liste an.
 
-Damit dabei nichts verloren geht:
-
-  * Jeder Eintrag hat eine eigene Kennung. Zwei Personen koennen
-    gleichzeitig etwas eintragen, ohne sich zu ueberschreiben.
-  * Geloeschtes wird als geloescht vermerkt, statt einfach zu
-    verschwinden. Sonst waere es beim naechsten Abgleich wieder da.
-  * Legt der Drive eine Konfliktkopie an, wird sie automatisch
-    eingelesen und nach "daten\backups" weggeraeumt.
-  * Einmal taeglich wird eine Sicherung in "daten\backups" abgelegt.
-    Die letzten 30 bleiben erhalten.
+Beim Neuladen kommt immer der aktuelle Stand. Der Server schaltet das
+Zwischenspeichern im Browser ab - beim Bearbeiten sieht man sofort,
+was man geaendert hat.
 
 
 EINSTELLUNGEN
 -------------
 
-Anderer Port:
-  Eine Datei "port.txt" anlegen und nur die Zahl hineinschreiben,
-  zum Beispiel   8090
+Alles steht in der Datei "einstellungen.txt". Sie wird beim ersten
+Start angelegt. Nach einer Aenderung den Server neu starten.
 
-Browser soll sich nicht oeffnen:
-  Eine leere Datei "kein-browser.txt" anlegen.
+  port = 8080       Auf welchem Port der Server laeuft.
+                    Bei "80" entfaellt die Portangabe in der Adresse:
+                    dann genuegt  http://localhost
+                    Ist der Port belegt, nimmt der Server von selbst
+                    den naechsten freien.
+
+  ordner = www      Welcher Ordner angezeigt wird.
+
+  browser = ja      Browser beim Start oeffnen.
+
+  netzwerk = nein   Bei "ja" koennen auch Handy, Tablet oder die
+                    Kollegen im selben Netz die Seiten aufrufen.
+                    Die Adresse dafuer steht dann beim Start dabei.
+
+  ordnerliste = ja  Ordnerinhalt anzeigen, wenn keine index.html da ist.
+
+
+PHP UND SQLITE
+--------------
+
+Fuer PHP wird ein PHP im Ordner gebraucht:
+
+  1. Auf https://windows.php.net/download die Fassung
+     "VS17 x64 Non Thread Safe" als ZIP herunterladen.
+  2. Entpacken und den Ordner "php" nennen, direkt neben server.js.
+     Es muss also "php\php-cgi.exe" geben.
+  3. Server neu starten.
+
+Beim ersten Start legt der Server dort eine "php.ini" an, in der
+SQLite und die ueblichen Erweiterungen eingeschaltet sind. Eine
+bereits vorhandene "php.ini" wird nie veraendert.
+
+Ob alles laeuft, zeigt   http://localhost:8080/test.php
+
+SQLite braucht keine Installation - die Datenbank ist einfach eine
+Datei. In PHP genuegt:
+
+  $db = new PDO("sqlite:" . __DIR__ . "/../daten/meine.sqlite");
+
+Datenbanken gehoeren nicht in "www", sondern daneben - zum Beispiel
+in einen Ordner "daten". Sicherheitshalber liefert der Server
+Dateien wie .sqlite, .db und .env ohnehin nie an den Browser aus,
+auch wenn sie in "www" liegen.
+
+
+WAS IM ORDNER LIEGEN MUSS
+-------------------------
+
+  server.js             das Programm
+  node.exe              wird zum Ausfuehren gebraucht (rund 80 MB)
+  www\                  die eigenen Seiten
+  php\                  nur noetig, wenn PHP verwendet wird
+  einstellungen.txt     legt der Server selbst an
+
+  Webserver starten.vbs
+  Webserver mit Fenster starten.cmd
+  Webserver beenden.cmd
+  Webserver starten.command      (fuer Mac)
+
+Die "node.exe" muss NICHT installiert werden - sie liegt einfach mit
+im Ordner. Fehlt sie, sagen die Startdateien, wo es sie gibt.
 
 
 WENN ETWAS NICHT STIMMT
 -----------------------
 
 "Node.js wurde nicht gefunden"
-  Die node.exe fehlt im Ordner. Sie steckt in der ZIP-Datei
+  Die node.exe fehlt. Sie steckt in der ZIP-Datei
   "Windows Binary (.zip)" auf https://nodejs.org/en/download
   im Ordner "node-vXX-win-x64".
 
-"Der Urlaubskalender laeuft auf diesem Rechner bereits"
-  Alles in Ordnung - er wird einfach im Browser geoeffnet.
+"PHP ist nicht eingerichtet"
+  Der Ordner "php" fehlt - siehe oben.
 
-Der Kalender zeigt "Nicht gefunden"
-  Der Ordner "web" fehlt.
+Die Seite zeigt eine Ordnerliste statt der Startseite
+  In dem Ordner fehlt eine "index.html".
 
-Sonstiges
-  In "daten\server-log-RECHNERNAME.txt" steht mit, was passiert ist.
+Port 80 laesst sich nicht verwenden
+  Er ist meist schon belegt, oft von IIS oder Skype.
+  In "einstellungen.txt" zum Beispiel 8080 eintragen.
+
+Aenderungen an einer Seite sind nicht zu sehen
+  Der Server sendet immer den aktuellen Stand. Haelt der Browser
+  etwas fest, hilft Strg+F5.

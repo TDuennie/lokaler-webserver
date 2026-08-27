@@ -1,109 +1,113 @@
-# Urlaubskalender – lokaler Webserver
+# Lokaler Webserver
 
-Ein Webserver, der auf jedem Arbeitsplatz einzeln läuft. Alle Arbeitsplätze
-arbeiten dabei auf **derselben Datei in einem gemeinsamen Drive-Ordner**.
-Es gibt keinen zentralen Server und keine Verbindung ins Internet.
+Ein kleiner Webserver zum Mitnehmen. Zeigt die Dateien aus einem Ordner im
+Browser an – HTML, CSS, Bilder, PDF, Video – und führt PHP-Seiten aus,
+SQLite inklusive.
 
-Der ganze Ordner lässt sich in den Drive legen und von dort starten – es muss
-nichts installiert werden.
-
-## Aufbau im Drive-Ordner
-
-```
-Urlaubskalender/
-├── server.js                              das Programm
-├── node.exe                               ~80 MB, wird nur mitgelegt
-├── web/                                   die Oberfläche
-├── daten/                                 legt der Server selbst an
-│   ├── urlaubskalender-daten.json         der gemeinsame Stand
-│   ├── backups/                           tägliche Sicherung, 30 Stück
-│   └── server-log-<rechner>.txt
-├── Urlaubskalender starten.vbs            startet ohne Fenster
-├── Urlaubskalender mit Fenster starten.cmd
-├── Urlaubskalender beenden.cmd
-└── LIESMICH.txt                           Anleitung für die Kollegen
-```
-
-`node.exe`, `web/` und `daten/` liegen bewusst **nicht** in diesem Repository:
-die erste ist zu groß, `daten/` enthält Namen von Mitarbeitern, und die
-Oberfläche wird separat gepflegt.
+Der ganze Ordner lässt sich in einen Drive legen und von dort per Doppelklick
+starten. Installiert werden muss nichts: `node.exe` liegt einfach daneben.
+Alle Pfade sind relativ zum Server, der Ordner darf also beliebig verschoben
+oder kopiert werden.
 
 ## Starten
 
-| Datei | Wirkung |
+| Datei | |
 | --- | --- |
-| `Urlaubskalender starten.vbs` | Start im Hintergrund, Browser öffnet sich |
-| `Urlaubskalender mit Fenster starten.cmd` | Start mit sichtbaren Meldungen |
-| `Urlaubskalender beenden.cmd` | beendet den laufenden Server |
+| `Webserver starten.vbs` | Windows, ohne Fenster, Browser öffnet sich |
+| `Webserver mit Fenster starten.cmd` | Windows, mit allen Meldungen |
+| `Webserver beenden.cmd` | beendet den laufenden Server |
+| `Webserver starten.command` | macOS und Linux |
 
-Die Startdateien nehmen die `node.exe` aus dem eigenen Ordner. Nur wenn sie
-fehlt, weichen sie auf ein installiertes Node.js aus; ist auch das nicht da,
-erklären sie, wo man die Datei bekommt.
-
-Auf dem Mac oder unter Linux geht es direkt:
+Oder direkt:
 
 ```bash
 node server.js
+node server.js --port 80 --ordner htdocs --netzwerk
 ```
 
-## Wie mehrere Arbeitsplätze zusammenkommen
+Die Startdateien nehmen ein `node.exe` aus dem eigenen Ordner und weichen nur
+ersatzweise auf ein installiertes Node.js aus.
 
-Ein gemeinsamer Ordner ist keine Datenbank – zwei gleichzeitige Änderungen
-könnten sich gegenseitig überschreiben. Dagegen tut der Server Folgendes:
+## Was der Server kann
 
-- **Jeder Datensatz hat eine feste Kennung und einen Zeitstempel.** Beim
-  Zusammenführen gewinnt der jüngere Stand.
-- **Vor jedem Schreiben wird die Datei frisch gelesen** und die eigene
-  Änderung hineingemischt – nie einfach überschrieben.
-- **Gelöschtes wird als gelöscht markiert**, statt zu verschwinden. Sonst
-  brächte der nächste Abgleich es zurück.
-- **Geschrieben wird über eine Nebendatei mit anschließendem Umbenennen.**
-  So bleibt nie eine halb geschriebene Datei zurück.
-- **Konfliktkopien des Sync-Clients werden erkannt**, eingemischt und nach
-  `daten/backups/` weggeräumt.
-- **Der Ordner wird überwacht** (plus alle 5 Sekunden ein Blick zur
-  Sicherheit, weil Sync-Ordner Änderungen nicht zuverlässig melden). Kommt
-  ein neuer Stand an, laden alle offenen Browser ihn automatisch nach.
-- **Kurzzeitige Dateisperren** durch Virenscanner oder den Sync-Client
-  (`EPERM`, `EBUSY`) werden mehrfach wiederholt statt als Fehler gemeldet.
+- **Statische Dateien** aus `www/` mit passenden Dateitypen – HTML, CSS, JS,
+  Bilder, Schriften, PDF, Video, Audio, WebAssembly.
+- **PHP** über `php-cgi`, mit `$_GET`, `$_POST`, Cookies, Sitzungen, eigenen
+  Kopfzeilen und Statuscodes. `index.php` wird als Startseite erkannt.
+- **SQLite** über PHP. Fehlt die `php.ini` eines frisch entpackten PHP, legt
+  der Server eine an, in der `pdo_sqlite` eingeschaltet ist – eine vorhandene
+  wird nie verändert.
+- **Ordnerliste**, wenn keine `index.html` vorhanden ist.
+- **Bereichsabfragen** (`Range`), damit sich Video und Audio vorspulen lassen.
+- **Kein Zwischenspeichern** – ein Neuladen zeigt immer den aktuellen Stand.
+- **Freier Port**: Ist der eingestellte belegt, nimmt der Server den nächsten.
+- **Browser öffnet sich** beim Start, unter Windows, macOS und Linux.
+
+Nicht ausgeliefert werden `.sqlite`, `.db`, `.env`, `.ini` und `.htaccess` –
+auch dann nicht, wenn sie in `www/` liegen. PHP kann sie normal öffnen.
+Ebenso wird alles abgewiesen, was aus dem Ordner herausführt.
+
+Standardmäßig lauscht der Server nur auf `127.0.0.1` und ist vom Netzwerk aus
+nicht erreichbar. Mit `netzwerk = ja` wird er für andere Geräte im selben Netz
+geöffnet; die Startmeldung nennt dann die Adresse und weist darauf hin.
 
 ## Einstellungen
 
-| Datei im Ordner | Wirkung |
-| --- | --- |
-| `port.txt` | anderer Port, nur die Zahl hineinschreiben (Standard 8080) |
-| `kein-browser.txt` | leere Datei anlegen, dann öffnet sich der Browser nicht |
+Alles steht in `einstellungen.txt`, die beim ersten Start angelegt wird:
 
-Alternativ per Umgebungsvariable: `PORT` und `KEIN_BROWSER=1`.
-
-Der Server lauscht ausschließlich auf `127.0.0.1` – vom Netzwerk aus ist er
-nicht erreichbar.
-
-## Schnittstelle
-
-| Weg | Zweck |
-| --- | --- |
-| `GET /api/daten` | aktueller Stand |
-| `GET /api/version` | nur die Versionsnummer |
-| `GET /api/ereignisse` | dauerhaft offene Verbindung, meldet jede Änderung |
-| `POST /api/aktion` | eine Änderung durchführen |
-
-Aktionen für `POST /api/aktion`:
-
-```jsonc
-{ "art": "mitarbeiterHinzufuegen", "name": "Anna Berger" }
-{ "art": "mitarbeiterAktiv",       "name": "Anna Berger", "aktiv": false }
-{ "art": "eintragSpeichern",       "eintrag": { "mitarbeiter": "Anna Berger",
-                                                "typ": "U",          // U, K oder P
-                                                "von": "2026-09-01",
-                                                "bis": "2026-09-14",
-                                                "vertreter": ["Bernd Klein"] } }
-{ "art": "eintragLoeschen",        "id": "e1a2b3c4" }
-{ "art": "allesErsetzen",          "mitarbeiter": [], "eintraege": [] }
+```ini
+port        = 8080    # 80 bedeutet: http://localhost ohne Portangabe
+ordner      = www     # welcher Ordner ausgeliefert wird
+browser     = ja      # Browser beim Start öffnen
+netzwerk    = nein    # auch für andere Geräte im Netz erreichbar
+ordnerliste = ja      # Ordnerinhalt zeigen, wenn keine index.html da ist
 ```
 
-`typ` ist `U` (Urlaub), `K` (Krankheit) oder `P` (Planung). Wer eine Aktion
-schickt, kann eine eigene Kennung als `absender` mitgeben – dann bekommt
-dieser Browser die eigene Änderung nicht noch einmal gemeldet.
+Das Gleiche geht über die Befehlszeile (`--port`, `--ordner`, `--netzwerk`,
+`--kein-browser`, `--kein-listing`) und über die Umgebungsvariablen `PORT`,
+`ORDNER`, `IM_NETZWERK`, `KEIN_BROWSER`. Die Befehlszeile hat Vorrang vor der
+Umgebung, diese vor der Einstellungsdatei.
 
-Alles, was nicht unter `/api/` liegt, wird als Datei aus `web/` ausgeliefert.
+### Port 80
+
+`port = 80` macht die Adresse zu `http://localhost` ohne Portangabe. Unter
+Windows geht das ohne besondere Rechte, solange der Port frei ist – belegt ist
+er dort häufig durch IIS oder Skype. Unter macOS und Linux sind Ports unter
+1024 geschützt, dort braucht es `sudo node server.js`. In beiden Fällen sagt
+der Server beim Start, was zu tun ist.
+
+## PHP einrichten
+
+1. Auf [windows.php.net/download](https://windows.php.net/download) die
+   Fassung **VS17 x64 Non Thread Safe** als ZIP laden.
+2. Entpacken und den Ordner `php` neben `server.js` legen, sodass es
+   `php/php-cgi.exe` gibt.
+3. Server neu starten.
+
+Gesucht wird in dieser Reihenfolge: `php/php-cgi.exe`, `php/php-cgi`,
+`php-cgi.exe`, `php-cgi` im Serverordner, danach `php-cgi` im System. Die
+Startmeldung zeigt, welches PHP gefunden wurde und ob SQLite bereitsteht.
+
+`www/test.php` prüft beides und legt eine kleine SQLite-Datenbank an.
+
+## Aufbau
+
+```
+lokaler-webserver/
+├── server.js                          der Server
+├── node.exe                           ~80 MB, nur mitgelegt
+├── php/                               nur nötig für PHP
+├── www/                               die eigenen Seiten
+│   ├── index.html
+│   └── test.php                       Selbsttest, darf weg
+├── daten/                             guter Platz für SQLite-Dateien
+├── einstellungen.txt                  legt der Server selbst an
+├── Webserver starten.vbs
+├── Webserver mit Fenster starten.cmd
+├── Webserver beenden.cmd
+├── Webserver starten.command
+└── LIESMICH.txt
+```
+
+`node.exe`, `php/` und `daten/` liegen nicht im Repository – zu groß
+beziehungsweise inhaltlich nichts, was versioniert gehört.

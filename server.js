@@ -1,1219 +1,1092 @@
 "use strict";
 
 /*
-    Urlaubskalender - lokaler Webserver mit gemeinsamer Datei
-    ---------------------------------------------------------
-    Jeder Arbeitsplatz startet seinen eigenen Server. Alle arbeiten auf
-    derselben Datei im MERKUR drive.
+    Lokaler Webserver
+    -----------------
 
-    Damit dabei nichts verloren geht:
+    Liefert die Dateien aus dem Ordner "www" im Browser aus und fuehrt
+    dabei PHP-Seiten aus, sofern PHP im Ordner liegt oder installiert ist.
 
-      * Jeder Eintrag hat eine feste ID und einen Zeitstempel.
-      * Vor JEDEM Schreiben wird die Datei frisch von der Platte gelesen
-        und die eigene Aenderung hineingemischt - nie einfach ueberschrieben.
-      * Geloeschtes wird als geloescht markiert statt entfernt, sonst
-        taucht es beim naechsten Abgleich wieder auf.
-      * Die Datei wird ueberwacht. Sobald der Sync eine neue Fassung
-        bringt, laden alle offenen Browser sie automatisch nach.
-      * Konfliktdateien des Sync-Clients werden erkannt und eingemischt.
+    Alles laeuft relativ zu dieser Datei. Der Ordner darf also verschoben,
+    kopiert oder in einem Drive abgelegt werden - der Server findet sich
+    immer selbst.
+
+    Aufruf:
+        node server.js
+        node server.js --port 3000 --ordner htdocs --netzwerk
 */
 
 const http = require("http");
 const fs   = require("fs");
 const fsp  = require("fs/promises");
 const path = require("path");
-const os   = require("os");
+const url  = require("url");
+const { spawn } = require("child_process");
 
-const ORDNER        = __dirname;
-const WEB_ORDNER    = path.join(ORDNER, "web");
-const DATEN_ORDNER  = path.join(ORDNER, "daten");
-const DATEN_NAME    = "urlaubskalender-daten.json";
-const DATEN_DATEI   = path.join(DATEN_ORDNER, DATEN_NAME);
-const BACKUP_ORDNER = path.join(DATEN_ORDNER, "backups");
+const ORDNER = __dirname;
 
-const BACKUPS_BEHALTEN     = 30;
-const GELOESCHTES_AUFRAEUMEN_NACH_TAGEN = 90;
+/* ===== Einstellungen ===== */
 
-// Wie oft zusaetzlich zur Ueberwachung nachgesehen wird (Sync-Ordner
-// melden Aenderungen nicht immer zuverlaessig)
-const NACHSEHEN_INTERVALL = 5000;
+// Einstellungen kommen aus Textdateien neben dem Server (damit sie sich
+// per Doppelklick nutzen lassen), aus Umgebungsvariablen oder von der
+// Befehlszeile. Die Befehlszeile hat immer das letzte Wort.
 
-/* ===== Port ===== */
+function textDatei(name) {
 
-function portErmitteln() {
-
-    const ausUmgebung =
-        Number(process.env.PORT);
-
-    if (ausUmgebung > 0) {
-        return ausUmgebung;
-    }
-
-    const portDatei =
-        path.join(ORDNER, "port.txt");
-
-    if (fs.existsSync(portDatei)) {
-
-        const ausDatei =
-            Number(fs.readFileSync(portDatei, "utf8").trim());
-
-        if (ausDatei > 0) {
-            return ausDatei;
-        }
-    }
-
-    return 8080;
-}
-
-const PORT = portErmitteln();
-
-/* ===== Zustand ===== */
-
-let zustand = {
-    version: 0,
-    mitarbeiter: [],
-    eintraege: []
-};
-
-let schreibKette = Promise.resolve();
-
-// Alle offenen Browser, die auf Live-Meldungen warten
-const zuhoerer = new Set();
-
-function jetzt() {
-    return new Date().toISOString();
-}
-
-function neueId() {
-    return "e" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
-
-class HttpFehler extends Error {
-
-    constructor(status, nachricht) {
-        super(nachricht);
-        this.status = status;
-    }
-}
-
-function anAlleVerteilen(ereignis) {
-
-    const block =
-        "data: " + JSON.stringify(ereignis) + "\n\n";
-
-    for (const antwort of zuhoerer) {
-
-        try {
-            antwort.write(block);
-        } catch (fehler) {
-            zuhoerer.delete(antwort);
-        }
-    }
-}
-
-/* ===== Datensaetze vereinheitlichen ===== */
-
-function mitarbeiterNormalisieren(roh) {
-
-    return {
-        name: String(roh.name),
-        aktiv: roh.aktiv !== false,
-        geloescht: roh.geloescht === true,
-        geaendert: typeof roh.geaendert === "string" ? roh.geaendert : "1970-01-01T00:00:00.000Z"
-    };
-}
-
-function eintragNormalisieren(roh) {
-
-    return {
-        id: roh.id || neueId(),
-        mitarbeiter: String(roh.mitarbeiter),
-        typ: String(roh.typ),
-        von: String(roh.von),
-        bis: String(roh.bis),
-        vertreter: Array.isArray(roh.vertreter) ? roh.vertreter.map(String) : [],
-        geloescht: roh.geloescht === true,
-        geaendert: typeof roh.geaendert === "string" ? roh.geaendert : "1970-01-01T00:00:00.000Z"
-    };
-}
-
-function rohInZustand(roh) {
-
-    const mitarbeiter =
-        Array.isArray(roh && roh.mitarbeiter) ? roh.mitarbeiter : [];
-
-    const eintraege =
-        Array.isArray(roh && roh.eintraege) ? roh.eintraege : [];
-
-    return {
-        version: 0,
-        mitarbeiter: mitarbeiter.map(mitarbeiterNormalisieren),
-        eintraege: eintraege.map(eintragNormalisieren)
-    };
-}
-
-/* ===== Zusammenfuehren ===== */
-
-function neuerVon(a, b) {
-
-    // Bei gleichem Zeitstempel gewinnt der bereits vorhandene Datensatz,
-    // damit das Ergebnis unabhaengig von der Reihenfolge gleich bleibt.
-    return (b.geaendert > a.geaendert) ? b : a;
-}
-
-function listeZusammenfuehren(eigene, fremde, schluesselVon) {
-
-    const nachSchluessel = new Map();
-
-    for (const datensatz of eigene) {
-        nachSchluessel.set(schluesselVon(datensatz), datensatz);
-    }
-
-    for (const datensatz of fremde) {
-
-        const schluessel =
-            schluesselVon(datensatz);
-
-        const vorhanden =
-            nachSchluessel.get(schluessel);
-
-        nachSchluessel.set(
-            schluessel,
-            vorhanden ? neuerVon(vorhanden, datensatz) : datensatz
-        );
-    }
-
-    return Array.from(nachSchluessel.values());
-}
-
-function zustaendeZusammenfuehren(eigener, fremder) {
-
-    return {
-        version: eigener.version,
-
-        mitarbeiter: listeZusammenfuehren(
-            eigener.mitarbeiter,
-            fremder.mitarbeiter,
-            function (person) { return person.name.toLowerCase(); }
-        ),
-
-        eintraege: listeZusammenfuehren(
-            eigener.eintraege,
-            fremder.eintraege,
-            function (eintrag) { return eintrag.id; }
-        )
-    };
-}
-
-function altesAufraeumen(stand) {
-
-    const grenze =
-        new Date(Date.now() - GELOESCHTES_AUFRAEUMEN_NACH_TAGEN * 24 * 60 * 60 * 1000)
-            .toISOString();
-
-    const behalten = function (datensatz) {
-        return !datensatz.geloescht || datensatz.geaendert > grenze;
-    };
-
-    stand.mitarbeiter = stand.mitarbeiter.filter(behalten);
-    stand.eintraege = stand.eintraege.filter(behalten);
-
-    return stand;
-}
-
-/* ===== Sichtbarer Stand fuer den Browser ===== */
-
-function sichtbarerStand(stand) {
-
-    const nichtGeloescht = function (datensatz) {
-        return !datensatz.geloescht;
-    };
-
-    const ohneVerwaltung = function (datensatz) {
-
-        const kopie = Object.assign({}, datensatz);
-
-        delete kopie.geloescht;
-
-        return kopie;
-    };
-
-    return {
-        version: stand.version,
-        mitarbeiter: stand.mitarbeiter.filter(nichtGeloescht).map(ohneVerwaltung),
-        eintraege: stand.eintraege.filter(nichtGeloescht).map(ohneVerwaltung)
-    };
-}
-
-/* ===== Lesen ===== */
-
-function dateiLesen(pfad) {
-
-    const text =
-        fs.readFileSync(pfad, "utf8");
-
-    if (!text || text.trim() === "") {
+    try {
+        const inhalt = fs.readFileSync(path.join(ORDNER, name), "utf8").trim();
+        return inhalt === "" ? null : inhalt;
+    } catch (fehler) {
         return null;
     }
-
-    return rohInZustand(JSON.parse(text));
 }
 
-function konfliktDateienEinsammeln() {
-
-    // Der Sync-Client legt bei gleichzeitigen Aenderungen Dateien wie
-    // "urlaubskalender-daten (Konfliktkopie ...).json" an. Weil jeder
-    // Eintrag eine ID hat, lassen sie sich verlustfrei einmischen.
-
-    const gefunden = [];
-
-    try {
-
-        for (const name of fs.readdirSync(DATEN_ORDNER)) {
-
-            const istKonflikt =
-                name !== DATEN_NAME &&
-                name.toLowerCase().endsWith(".json") &&
-                name.toLowerCase().startsWith("urlaubskalender-daten");
-
-            if (istKonflikt) {
-                gefunden.push(path.join(DATEN_ORDNER, name));
-            }
-        }
-
-    } catch (fehler) {
-        // Ordner noch nicht da
-    }
-
-    return gefunden;
+function dateiVorhanden(name) {
+    return fs.existsSync(path.join(ORDNER, name));
 }
 
-function vonPlatteLesen() {
+function argument(name) {
 
-    let stand = null;
+    const stelle = process.argv.indexOf("--" + name);
+
+    if (stelle >= 0 && process.argv[stelle + 1] && !process.argv[stelle + 1].startsWith("--")) {
+        return process.argv[stelle + 1];
+    }
+
+    return null;
+}
+
+function schalter(name) {
+    return process.argv.indexOf("--" + name) >= 0;
+}
+
+/* ===== Einstellungsdatei ===== */
+
+const EINSTELLUNGSDATEI = path.join(ORDNER, "einstellungen.txt");
+
+const VORLAGE = [
+    "# Einstellungen fuer den lokalen Webserver",
+    "# Nach einer Aenderung den Server neu starten.",
+    "",
+    "",
+    "# Auf welchem Port der Server laeuft.",
+    "#",
+    "#   8080   ueblich zum Entwickeln:  http://localhost:8080",
+    "#   80     dann entfaellt die Portangabe:  http://localhost",
+    "#          Achtung: Port 80 ist oft schon belegt, und unter macOS",
+    "#          und Linux braucht er besondere Rechte (sudo).",
+    "#",
+    "# Ist der Port belegt, nimmt der Server von selbst den naechsten freien.",
+    "",
+    "port = 8080",
+    "",
+    "",
+    "# Welcher Ordner im Browser gezeigt wird - dort gehoeren die",
+    "# eigenen Seiten hinein.",
+    "",
+    "ordner = www",
+    "",
+    "",
+    "# Beim Start den Browser oeffnen?   ja / nein",
+    "",
+    "browser = ja",
+    "",
+    "",
+    "# Sollen andere Geraete im selben Netz (Handy, Tablet, Kollegen)",
+    "# die Seiten auch aufrufen koennen?   ja / nein",
+    "# Bei \"nein\" ist der Server nur auf diesem Rechner erreichbar.",
+    "",
+    "netzwerk = nein",
+    "",
+    "",
+    "# Wenn in einem Ordner keine index.html liegt: den Inhalt des",
+    "# Ordners auflisten?   ja / nein",
+    "",
+    "ordnerliste = ja",
+    ""
+].join("\r\n");
+
+function einstellungenLesen() {
+
+    const werte = {};
+
+    let inhalt = null;
 
     try {
-
-        if (fs.existsSync(DATEN_DATEI)) {
-            stand = dateiLesen(DATEN_DATEI);
-        }
-
+        inhalt = fs.readFileSync(EINSTELLUNGSDATEI, "utf8");
     } catch (fehler) {
-        console.warn("Datendatei nicht lesbar, bisheriger Stand bleibt:", fehler.message);
-        return null;
-    }
 
-    if (!stand) {
-        stand = { version: 0, mitarbeiter: [], eintraege: [] };
-    }
-
-    // Konfliktkopien einmischen und danach wegraeumen
-    for (const pfad of konfliktDateienEinsammeln()) {
-
+        // Beim ersten Start eine Vorlage hinlegen, damit sich alles
+        // ohne Befehlszeile einstellen laesst.
         try {
-
-            const ausKonflikt =
-                dateiLesen(pfad);
-
-            if (ausKonflikt) {
-
-                stand = zustaendeZusammenfuehren(stand, ausKonflikt);
-
-                console.log("Konfliktkopie eingemischt: " + path.basename(pfad));
-            }
-
-            fs.renameSync(pfad, path.join(BACKUP_ORDNER, path.basename(pfad)));
-
-        } catch (fehler) {
-
-            try {
-                fs.mkdirSync(BACKUP_ORDNER, { recursive: true });
-                fs.renameSync(pfad, path.join(BACKUP_ORDNER, path.basename(pfad)));
-            } catch (zweiterFehler) {
-                console.warn("Konfliktkopie nicht verarbeitbar:", path.basename(pfad));
-            }
-        }
-    }
-
-    return stand;
-}
-
-/* ===== Schreiben ===== */
-
-const GESPERRT_CODES = ["EPERM", "EBUSY", "EACCES", "EEXIST"];
-
-async function mitWiederholung(arbeit) {
-
-    // Virenscanner und der Sync-Client greifen unter Windows kurz auf
-    // frisch geschriebene Dateien zu. Das aeussert sich als EPERM/EBUSY
-    // und ist nach wenigen Millisekunden wieder vorbei.
-
-    const HOECHSTENS = 12;
-
-    for (let versuch = 1; ; versuch++) {
-
-        try {
-            return await arbeit();
-
-        } catch (fehler) {
-
-            const nurKurzGesperrt =
-                GESPERRT_CODES.indexOf(fehler.code) >= 0;
-
-            if (!nurKurzGesperrt || versuch >= HOECHSTENS) {
-                throw fehler;
-            }
-
-            await new Promise(function (weiter) {
-                setTimeout(weiter, 25 * versuch);
-            });
-        }
-    }
-}
-
-let zuletztGeschrieben = "";
-
-async function zustandSchreiben(neuerZustand) {
-
-    await fsp.mkdir(DATEN_ORDNER, { recursive: true });
-
-    const inhalt =
-        JSON.stringify({
-            mitarbeiter: neuerZustand.mitarbeiter,
-            eintraege: neuerZustand.eintraege
-        }, null, 2);
-
-    // Erst vollstaendig in eine Nebendatei schreiben, dann umbenennen.
-    // So kann die Datendatei nie halb geschrieben zurueckbleiben.
-
-    const temporaer =
-        DATEN_DATEI + "." + process.pid + "." + Date.now() + ".sichern";
-
-    try {
-
-        await mitWiederholung(function () {
-            return fsp.writeFile(temporaer, inhalt, "utf8");
-        });
-
-        await mitWiederholung(function () {
-            return fsp.rename(temporaer, DATEN_DATEI);
-        });
-
-        zuletztGeschrieben = inhalt;
-
-    } catch (fehler) {
-
-        await fsp.unlink(temporaer).catch(function () {});
-
-        throw fehler;
-    }
-}
-
-async function backupSchreiben() {
-
-    try {
-
-        const heute =
-            new Date().toISOString().slice(0, 10);
-
-        const ziel =
-            path.join(BACKUP_ORDNER, "daten-" + heute + ".json");
-
-        if (fs.existsSync(ziel)) {
-            return;
+            fs.writeFileSync(EINSTELLUNGSDATEI, VORLAGE, "utf8");
+        } catch (zweiterFehler) {
+            // Schreibgeschuetzter Ordner - dann gelten die Standardwerte
         }
 
-        await fsp.mkdir(BACKUP_ORDNER, { recursive: true });
-        await fsp.copyFile(DATEN_DATEI, ziel);
+        return werte;
+    }
 
-        const vorhandene =
-            (await fsp.readdir(BACKUP_ORDNER))
-                .filter(function (name) { return name.startsWith("daten-"); })
-                .sort();
+    for (const zeile of inhalt.split(/\r?\n/)) {
 
-        const zuLoeschen =
-            vorhandene.slice(0, Math.max(0, vorhandene.length - BACKUPS_BEHALTEN));
+        const ohneKommentar = zeile.split("#")[0].trim();
 
-        for (const name of zuLoeschen) {
-            await fsp.unlink(path.join(BACKUP_ORDNER, name));
+        if (ohneKommentar === "") {
+            continue;
         }
 
-    } catch (fehler) {
-        console.warn("Backup fehlgeschlagen:", fehler.message);
+        const gleich = ohneKommentar.indexOf("=");
+
+        if (gleich < 0) {
+            continue;
+        }
+
+        werte[ohneKommentar.slice(0, gleich).trim().toLowerCase()] =
+            ohneKommentar.slice(gleich + 1).trim();
     }
+
+    return werte;
 }
 
-/* ===== Abgleich mit der Datei ===== */
+const DATEI_WERTE = einstellungenLesen();
 
-function standFingerabdruck(stand) {
+function jaNein(wert, standard) {
 
-    return JSON.stringify({
-        mitarbeiter: stand.mitarbeiter,
-        eintraege: stand.eintraege
-    });
-}
+    if (wert === undefined || wert === null || wert === "") {
+        return standard;
+    }
 
-function vonPlatteAuffrischen() {
+    const text = String(wert).trim().toLowerCase();
 
-    const vonPlatte =
-        vonPlatteLesen();
+    if (["ja", "j", "an", "ein", "wahr", "true", "1", "yes"].indexOf(text) >= 0) {
+        return true;
+    }
 
-    if (!vonPlatte) {
+    if (["nein", "n", "aus", "falsch", "false", "0", "no"].indexOf(text) >= 0) {
         return false;
     }
 
-    const vorher =
-        standFingerabdruck(zustand);
-
-    const zusammengefuehrt =
-        altesAufraeumen(zustaendeZusammenfuehren(zustand, vonPlatte));
-
-    zusammengefuehrt.version = zustand.version;
-
-    const nachher =
-        standFingerabdruck(zusammengefuehrt);
-
-    zustand = zusammengefuehrt;
-
-    return vorher !== nachher;
+    return standard;
 }
 
-function aenderungVonAussenPruefen() {
+// Reihenfolge: Befehlszeile schlaegt Umgebungsvariable schlaegt
+// Einstellungsdatei schlaegt Standardwert.
+const EINSTELLUNGEN = {
 
-    return inWarteschlange(async function () {
+    port: Number(argument("port") ||
+                 process.env.PORT ||
+                 DATEI_WERTE.port ||
+                 textDatei("port.txt") ||
+                 8080),
 
-        const hatSichGeaendert =
-            vonPlatteAuffrischen();
+    ordner: argument("ordner") ||
+            process.env.ORDNER ||
+            DATEI_WERTE.ordner ||
+            textDatei("ordner.txt") ||
+            "www",
 
-        if (!hatSichGeaendert) {
-            return;
-        }
+    imNetzwerk: schalter("netzwerk") ||
+                process.env.IM_NETZWERK === "1" ||
+                dateiVorhanden("im-netzwerk.txt") ||
+                jaNein(DATEI_WERTE.netzwerk, false),
 
-        zustand.version += 1;
+    keinBrowser: schalter("kein-browser") ||
+                 process.env.KEIN_BROWSER === "1" ||
+                 dateiVorhanden("kein-browser.txt") ||
+                 !jaNein(DATEI_WERTE.browser, true),
 
-        // Der eigene Stand kann jetzt Dinge enthalten, die noch nicht in
-        // der Datei stehen (z.B. aus einer eingemischten Konfliktkopie).
-        // Deshalb zurueckschreiben, damit alle denselben Stand bekommen.
-        if (standFingerabdruck(zustand) !== zuletztGeschrieben) {
-            await zustandSchreiben(zustand).catch(function (fehler) {
-                console.warn("Zurueckschreiben nach Abgleich fehlgeschlagen:", fehler.message);
-            });
-        }
+    keinListing: schalter("kein-listing") ||
+                 dateiVorhanden("kein-listing.txt") ||
+                 !jaNein(DATEI_WERTE.ordnerliste, true)
+};
 
-        console.log(new Date().toLocaleTimeString("de-DE") +
-                    "  Datei wurde von aussen geaendert - Stand uebernommen");
+if (!Number.isInteger(EINSTELLUNGEN.port) ||
+    EINSTELLUNGEN.port < 1 || EINSTELLUNGEN.port > 65535) {
 
-        anAlleVerteilen({
-            art: "aenderung",
-            meldung: "Die Daten wurden an einem anderen Arbeitsplatz geändert.",
-            absender: null,
-            zustand: sichtbarerStand(zustand)
-        });
-    });
+    console.error("");
+    console.error("  \"port\" muss eine Zahl zwischen 1 und 65535 sein.");
+    console.error("  Bitte in \"einstellungen.txt\" berichtigen. Ueblich sind 8080 oder 80.");
+    process.exit(1);
 }
 
-function dateiUeberwachen() {
+const WURZEL = path.resolve(ORDNER, EINSTELLUNGEN.ordner);
 
-    let anstehend = null;
+const ADRESSE = EINSTELLUNGEN.imNetzwerk ? "0.0.0.0" : "127.0.0.1";
 
-    const angestossen = function () {
+/* ===== PHP finden ===== */
 
-        // Mehrfach ausgeloeste Meldungen zusammenfassen
-        clearTimeout(anstehend);
+// Zuerst ein PHP, das im eigenen Ordner mitliegt - so muss auf dem
+// Arbeitsplatz nichts installiert werden. Sonst eines aus dem System.
 
-        anstehend = setTimeout(function () {
-            aenderungVonAussenPruefen().catch(function (fehler) {
-                console.warn("Abgleich fehlgeschlagen:", fehler.message);
-            });
-        }, 400);
-    };
+function phpSuchen() {
+
+    const kandidaten = [
+        path.join(ORDNER, "php", "php-cgi.exe"),
+        path.join(ORDNER, "php", "php-cgi"),
+        path.join(ORDNER, "php-cgi.exe"),
+        path.join(ORDNER, "php-cgi")
+    ];
+
+    for (const pfad of kandidaten) {
+        if (fs.existsSync(pfad)) {
+            return pfad;
+        }
+    }
+
+    // Im System suchen
+    const suchbefehl = process.platform === "win32" ? "where" : "which";
 
     try {
 
-        // Auf den Ordner hoeren, nicht auf die Datei: beim Ersetzen
-        // durch den Sync ginge ein Datei-Wachposten sonst verloren.
-        fs.watch(DATEN_ORDNER, function (ereignis, name) {
+        const ergebnis =
+            require("child_process").spawnSync(suchbefehl, ["php-cgi"], { encoding: "utf8" });
 
-            if (!name || name.toLowerCase().startsWith("urlaubskalender-daten")) {
-                angestossen();
+        if (ergebnis.status === 0) {
+            const erste = ergebnis.stdout.split(/\r?\n/)[0].trim();
+            if (erste) {
+                return erste;
             }
-        });
+        }
 
     } catch (fehler) {
-        console.warn("Ordner kann nicht ueberwacht werden:", fehler.message);
+        // Nicht gefunden - PHP bleibt einfach aus
     }
 
-    // Sicherheitsnetz: Sync-Ordner melden Aenderungen nicht immer
-    setInterval(angestossen, NACHSEHEN_INTERVALL).unref();
+    return null;
 }
 
-/* ===== Aktionen ===== */
-
-const TYP_TEXT = { U: "Urlaub", K: "Krankheit", P: "Planung" };
-
-function datumAnzeige(datumStr) {
-
-    const teile = datumStr.split("-");
-
-    return teile[2] + "." + teile[1] + "." + teile[0];
-}
-
-function eintragBeschreiben(eintrag) {
-
-    const zeitraum =
-        eintrag.von === eintrag.bis
-        ? datumAnzeige(eintrag.von)
-        : datumAnzeige(eintrag.von) + " – " + datumAnzeige(eintrag.bis);
-
-    const vertretung =
-        eintrag.vertreter.length > 0
-        ? " (Vertretung: " + eintrag.vertreter.join(", ") + ")"
-        : "";
-
-    return eintrag.mitarbeiter + " – " +
-           (TYP_TEXT[eintrag.typ] || eintrag.typ) + " " +
-           zeitraum + vertretung;
-}
-
-function eintragPruefen(roh) {
-
-    if (!roh || typeof roh !== "object") {
-        throw new HttpFehler(400, "Eintrag fehlt.");
-    }
-
-    const name =
-        String(roh.mitarbeiter || "").trim();
-
-    if (name === "") {
-        throw new HttpFehler(400, "Mitarbeiter fehlt.");
-    }
-
-    if (["U", "K", "P"].indexOf(roh.typ) < 0) {
-        throw new HttpFehler(400, "Ungueltiger Typ.");
-    }
-
-    const datumMuster = /^\d{4}-\d{2}-\d{2}$/;
-
-    if (!datumMuster.test(roh.von) || !datumMuster.test(roh.bis)) {
-        throw new HttpFehler(400, "Ungueltiges Datum.");
-    }
-
-    if (roh.von > roh.bis) {
-        throw new HttpFehler(400, "Das Von-Datum liegt nach dem Bis-Datum.");
-    }
-
-    return {
-        id: roh.id || null,
-        mitarbeiter: name,
-        typ: roh.typ,
-        von: roh.von,
-        bis: roh.bis,
-        vertreter: Array.isArray(roh.vertreter) ? roh.vertreter.map(String) : [],
-        geloescht: false,
-        geaendert: jetzt()
-    };
-}
-
-function lebendeMitarbeiter(stand) {
-    return stand.mitarbeiter.filter(function (p) { return !p.geloescht; });
-}
-
-function lebendeEintraege(stand) {
-    return stand.eintraege.filter(function (e) { return !e.geloescht; });
-}
-
-function aktionAnwenden(stand, aktion) {
-
-    if (!aktion || typeof aktion !== "object") {
-        throw new HttpFehler(400, "Aktion fehlt.");
-    }
-
-    switch (aktion.art) {
-
-        case "mitarbeiterHinzufuegen": {
-
-            const name =
-                String(aktion.name || "").trim();
-
-            if (name === "") {
-                throw new HttpFehler(400, "Name fehlt.");
-            }
-
-            const vorhanden =
-                stand.mitarbeiter.find(function (person) {
-                    return person.name.toLowerCase() === name.toLowerCase();
-                });
-
-            if (vorhanden && !vorhanden.geloescht) {
-                throw new HttpFehler(409, "\"" + name + "\" ist bereits angelegt.");
-            }
-
-            if (vorhanden) {
-
-                // War geloescht - wieder aufnehmen
-                vorhanden.name = name;
-                vorhanden.aktiv = true;
-                vorhanden.geloescht = false;
-                vorhanden.geaendert = jetzt();
-
-            } else {
-
-                stand.mitarbeiter.push({
-                    name: name,
-                    aktiv: true,
-                    geloescht: false,
-                    geaendert: jetzt()
-                });
-            }
-
-            return "Neuer Mitarbeiter: " + name;
-        }
-
-        case "mitarbeiterAktiv": {
-
-            const person =
-                lebendeMitarbeiter(stand).find(function (p) {
-                    return p.name === aktion.name;
-                });
-
-            if (!person) {
-                throw new HttpFehler(404, "Mitarbeiter nicht gefunden - bitte Seite neu laden.");
-            }
-
-            person.aktiv = Boolean(aktion.aktiv);
-            person.geaendert = jetzt();
-
-            return person.name + " ist jetzt " + (person.aktiv ? "aktiv" : "inaktiv");
-        }
-
-        case "eintragSpeichern": {
-
-            const eintrag =
-                eintragPruefen(aktion.eintrag);
-
-            if (eintrag.id) {
-
-                const index =
-                    stand.eintraege.findIndex(function (e) {
-                        return e.id === eintrag.id && !e.geloescht;
-                    });
-
-                if (index < 0) {
-                    throw new HttpFehler(409, "Dieser Eintrag wurde zwischenzeitlich von jemand anderem geloescht.");
-                }
-
-                stand.eintraege[index] = eintrag;
-
-                return "Geändert: " + eintragBeschreiben(eintrag);
-            }
-
-            eintrag.id = neueId();
-            stand.eintraege.push(eintrag);
-
-            return "Neu eingetragen: " + eintragBeschreiben(eintrag);
-        }
-
-        case "eintragLoeschen": {
-
-            const eintrag =
-                stand.eintraege.find(function (e) {
-                    return e.id === aktion.id && !e.geloescht;
-                });
-
-            if (!eintrag) {
-                return "Der Eintrag war bereits gelöscht.";
-            }
-
-            // Als geloescht markieren statt entfernen - sonst brächte
-            // der naechste Abgleich ihn wieder zurueck.
-            eintrag.geloescht = true;
-            eintrag.geaendert = jetzt();
-
-            return "Gelöscht: " + eintragBeschreiben(eintrag);
-        }
-
-        case "allesErsetzen": {
-
-            const mitarbeiter =
-                Array.isArray(aktion.mitarbeiter) ? aktion.mitarbeiter : null;
-
-            const eintraege =
-                Array.isArray(aktion.eintraege) ? aktion.eintraege : null;
-
-            if (!mitarbeiter || !eintraege) {
-                throw new HttpFehler(400, "Ungueltiges Format.");
-            }
-
-            const zeitpunkt = jetzt();
-
-            const gewollteNamen =
-                new Set(mitarbeiter.map(function (p) { return String(p.name).toLowerCase(); }));
-
-            const gewollteIds = new Set();
-
-            // Alles Bisherige als geloescht markieren, dann die
-            // gewuenschten Datensaetze wieder aufnehmen. So wird der
-            // Import auch bei den anderen Arbeitsplaetzen wirksam.
-
-            for (const person of stand.mitarbeiter) {
-                if (!gewollteNamen.has(person.name.toLowerCase()) && !person.geloescht) {
-                    person.geloescht = true;
-                    person.geaendert = zeitpunkt;
-                }
-            }
-
-            for (const roh of mitarbeiter) {
-
-                const name = String(roh.name);
-
-                const vorhanden =
-                    stand.mitarbeiter.find(function (p) {
-                        return p.name.toLowerCase() === name.toLowerCase();
-                    });
-
-                if (vorhanden) {
-                    vorhanden.name = name;
-                    vorhanden.aktiv = roh.aktiv !== false;
-                    vorhanden.geloescht = false;
-                    vorhanden.geaendert = zeitpunkt;
-                } else {
-                    stand.mitarbeiter.push({
-                        name: name,
-                        aktiv: roh.aktiv !== false,
-                        geloescht: false,
-                        geaendert: zeitpunkt
-                    });
-                }
-            }
-
-            for (const roh of eintraege) {
-
-                const geprueft = eintragPruefen(roh);
-
-                geprueft.id = geprueft.id || neueId();
-                geprueft.geaendert = zeitpunkt;
-
-                gewollteIds.add(geprueft.id);
-
-                const index =
-                    stand.eintraege.findIndex(function (e) { return e.id === geprueft.id; });
-
-                if (index >= 0) {
-                    stand.eintraege[index] = geprueft;
-                } else {
-                    stand.eintraege.push(geprueft);
-                }
-            }
-
-            for (const eintrag of stand.eintraege) {
-                if (!gewollteIds.has(eintrag.id) && !eintrag.geloescht) {
-                    eintrag.geloescht = true;
-                    eintrag.geaendert = zeitpunkt;
-                }
-            }
-
-            return "Alle Daten wurden ersetzt (" +
-                   lebendeMitarbeiter(stand).length + " Mitarbeiter, " +
-                   lebendeEintraege(stand).length + " Einträge).";
-        }
-
-        default:
-            throw new HttpFehler(400, "Unbekannte Aktion.");
-    }
-}
-
-function inWarteschlange(arbeit) {
-
-    // Alle Zugriffe auf die Datei laufen nacheinander ab, damit sich
-    // zwei gleichzeitige Klicks nicht ins Gehege kommen.
-
-    const ergebnis =
-        schreibKette.then(arbeit, arbeit);
-
-    schreibKette =
-        ergebnis.catch(function () {});
-
-    return ergebnis;
-}
-
-/* ===== HTTP ===== */
-
-const MIME_TYPEN = {
-    ".html": "text/html; charset=utf-8",
-    ".css":  "text/css; charset=utf-8",
-    ".js":   "text/javascript; charset=utf-8",
-    ".json": "application/json; charset=utf-8",
-    ".ico":  "image/x-icon",
-    ".png":  "image/png",
-    ".svg":  "image/svg+xml"
-};
-
-function jsonSenden(antwort, status, objekt) {
-
-    const inhalt =
-        JSON.stringify(objekt);
-
-    antwort.writeHead(status, {
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store",
-        "Content-Length": Buffer.byteLength(inhalt)
-    });
-
-    antwort.end(inhalt);
-}
-
-function koerperLesen(anfrage) {
-
-    return new Promise(function (resolve, reject) {
-
-        const teile = [];
-        let groesse = 0;
-
-        anfrage.on("data", function (teil) {
-
-            groesse += teil.length;
-
-            if (groesse > 5 * 1024 * 1024) {
-                reject(new HttpFehler(413, "Anfrage zu gross."));
-                anfrage.destroy();
-                return;
-            }
-
-            teile.push(teil);
-        });
-
-        anfrage.on("end", function () {
-
-            try {
-                resolve(JSON.parse(Buffer.concat(teile).toString("utf8")));
-            } catch (fehler) {
-                reject(new HttpFehler(400, "Ungueltiges JSON."));
-            }
-        });
-
-        anfrage.on("error", reject);
-    });
-}
-
-function dateiAusliefern(antwort, urlPfad) {
-
-    const relativ =
-        urlPfad === "/"
-        ? "index.html"
-        : decodeURIComponent(urlPfad).replace(/^\/+/, "");
-
-    const ziel =
-        path.resolve(WEB_ORDNER, relativ);
-
-    // Ausbrechen aus dem web-Ordner verhindern
-    if (ziel !== WEB_ORDNER && !ziel.startsWith(WEB_ORDNER + path.sep)) {
-        antwort.writeHead(403).end("Verboten");
+const PHP = phpSuchen();
+
+/* ===== PHP einsatzbereit machen ===== */
+
+// Ein frisch entpacktes PHP fuer Windows bringt keine "php.ini" mit.
+// Ohne sie sind saemtliche Erweiterungen aus - auch SQLite. Deshalb
+// legen wir einmalig eine an, wenn PHP im eigenen Ordner liegt.
+
+const PHP_INI_INHALT = [
+    "; Von \"Webserver starten\" angelegt.",
+    "; Diese Datei darf angepasst werden - sie wird nicht ueberschrieben.",
+    "",
+    "extension_dir = \"ext\"",
+    "",
+    "extension=pdo_sqlite",
+    "extension=sqlite3",
+    "extension=mbstring",
+    "extension=openssl",
+    "extension=curl",
+    "extension=gd",
+    "extension=fileinfo",
+    "extension=zip",
+    "extension=exif",
+    "",
+    "display_errors = On",
+    "error_reporting = E_ALL",
+    "",
+    "upload_max_filesize = 64M",
+    "post_max_size = 64M",
+    "max_execution_time = 120",
+    "date.timezone = Europe/Berlin",
+    ""
+].join("\r\n");
+
+function phpIniSicherstellen() {
+
+    if (!PHP) {
         return;
     }
 
-    fs.readFile(ziel, function (fehler, inhalt) {
+    // Nur bei einem mitgelieferten PHP eingreifen, nie bei einem,
+    // das auf dem Rechner installiert ist.
+    const phpOrdner = path.dirname(PHP);
 
-        if (fehler) {
-            antwort.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
-                   .end("Nicht gefunden");
+    if (!phpOrdner.startsWith(ORDNER)) {
+        return;
+    }
+
+    const ini = path.join(phpOrdner, "php.ini");
+
+    if (fs.existsSync(ini)) {
+        return;
+    }
+
+    try {
+
+        fs.writeFileSync(ini, PHP_INI_INHALT, "utf8");
+
+        console.log("");
+        console.log("  Hinweis: In " + phpOrdner + " fehlte die \"php.ini\".");
+        console.log("  Es wurde eine angelegt, in der unter anderem SQLite");
+        console.log("  eingeschaltet ist.");
+
+    } catch (fehler) {
+        console.warn("  \"php.ini\" liess sich nicht anlegen: " + fehler.message);
+    }
+}
+
+// Welche Erweiterungen kann dieses PHP? Wird nur fuer die Startmeldung
+// gebraucht und darf deshalb nie den Start aufhalten.
+function phpFaehigkeiten() {
+
+    if (!PHP) {
+        return null;
+    }
+
+    try {
+
+        const ergebnis =
+            require("child_process").spawnSync(PHP, ["-n", "-v"], { encoding: "utf8" });
+
+        const version =
+            /PHP (\d+\.\d+\.\d+)/.exec(ergebnis.stdout || "");
+
+        const module =
+            require("child_process").spawnSync(PHP, ["-m"], { encoding: "utf8" });
+
+        const liste =
+            (module.stdout || "").toLowerCase();
+
+        return {
+            version: version ? version[1] : null,
+            sqlite: liste.includes("pdo_sqlite") || liste.includes("sqlite3")
+        };
+
+    } catch (fehler) {
+        return null;
+    }
+}
+
+/* ===== Dateitypen ===== */
+
+const TYPEN = {
+    ".html": "text/html; charset=utf-8",
+    ".htm":  "text/html; charset=utf-8",
+    ".css":  "text/css; charset=utf-8",
+    ".js":   "text/javascript; charset=utf-8",
+    ".mjs":  "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".xml":  "application/xml; charset=utf-8",
+    ".txt":  "text/plain; charset=utf-8",
+    ".csv":  "text/csv; charset=utf-8",
+    ".md":   "text/plain; charset=utf-8",
+    ".svg":  "image/svg+xml",
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif":  "image/gif",
+    ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".ico":  "image/x-icon",
+    ".bmp":  "image/bmp",
+    ".mp4":  "video/mp4",
+    ".webm": "video/webm",
+    ".ogv":  "video/ogg",
+    ".mp3":  "audio/mpeg",
+    ".wav":  "audio/wav",
+    ".ogg":  "audio/ogg",
+    ".m4a":  "audio/mp4",
+    ".woff":  "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf":   "font/ttf",
+    ".otf":   "font/otf",
+    ".pdf":  "application/pdf",
+    ".zip":  "application/zip",
+    ".wasm": "application/wasm"
+};
+
+function typVon(datei) {
+    return TYPEN[path.extname(datei).toLowerCase()] || "application/octet-stream";
+}
+
+/* ===== Hilfen ===== */
+
+function fehlerSeite(antwort, status, ueberschrift, text) {
+
+    const seite =
+        "<!doctype html><html lang=\"de\"><meta charset=\"utf-8\">" +
+        "<title>" + status + "</title>" +
+        "<style>body{font:15px/1.6 system-ui,sans-serif;max-width:34rem;" +
+        "margin:5rem auto;padding:0 1.5rem;color:#1d2430}" +
+        "h1{font-size:1.2rem;margin:0 0 .5rem}p{color:#6b7484}" +
+        "code{background:#f1f3f6;padding:.1rem .35rem;border-radius:4px}</style>" +
+        "<h1>" + ueberschrift + "</h1><p>" + text + "</p>";
+
+    antwort.writeHead(status, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store"
+    });
+
+    antwort.end(seite);
+}
+
+function entschaerfen(text) {
+
+    return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+}
+
+function groesseAnzeigen(bytes) {
+
+    if (bytes < 1024) { return bytes + " B"; }
+    if (bytes < 1024 * 1024) { return (bytes / 1024).toFixed(1) + " KB"; }
+    if (bytes < 1024 * 1024 * 1024) { return (bytes / 1024 / 1024).toFixed(1) + " MB"; }
+
+    return (bytes / 1024 / 1024 / 1024).toFixed(1) + " GB";
+}
+
+// Dateien, die zwar im Ordner liegen duerfen, aber nicht ueber den
+// Browser abrufbar sein sollen - allen voran die SQLite-Datenbank.
+const GESCHUETZT = [".sqlite", ".sqlite3", ".db", ".db3", ".env", ".ini", ".htaccess"];
+
+function istGeschuetzt(datei) {
+
+    const name = path.basename(datei).toLowerCase();
+
+    if (name === ".env" || name === ".htaccess") {
+        return true;
+    }
+
+    return GESCHUETZT.indexOf(path.extname(name)) >= 0;
+}
+
+// Dateien, die Sync-Dienste und Betriebssysteme anlegen
+function istMuell(name) {
+
+    return name === ".DS_Store" ||
+           name === "desktop.ini" ||
+           name === "Thumbs.db" ||
+           name.startsWith("~$") ||
+           name.endsWith(".tmp");
+}
+
+/* ===== Verzeichnis anzeigen ===== */
+
+async function verzeichnisAnzeigen(antwort, ordner, urlPfad) {
+
+    if (EINSTELLUNGEN.keinListing) {
+        fehlerSeite(antwort, 403, "Kein Zugriff",
+                    "Die Anzeige von Ordnerinhalten ist abgeschaltet.");
+        return;
+    }
+
+    const namen =
+        (await fsp.readdir(ordner, { withFileTypes: true }))
+            .filter(function (eintrag) {
+                return !istMuell(eintrag.name) &&
+                       (eintrag.isDirectory() || !istGeschuetzt(eintrag.name));
+            })
+            .sort(function (a, b) {
+
+                if (a.isDirectory() !== b.isDirectory()) {
+                    return a.isDirectory() ? -1 : 1;
+                }
+
+                return a.name.localeCompare(b.name, "de");
+            });
+
+    const zeilen = [];
+
+    if (urlPfad !== "/") {
+        zeilen.push("<li class=\"o\"><a href=\"..\">&#8593; eine Ebene h&ouml;her</a></li>");
+    }
+
+    for (const eintrag of namen) {
+
+        const istOrdner = eintrag.isDirectory();
+
+        let groesse = "";
+
+        if (!istOrdner) {
+            try {
+                groesse = groesseAnzeigen((await fsp.stat(path.join(ordner, eintrag.name))).size);
+            } catch (fehler) {
+                groesse = "";
+            }
+        }
+
+        zeilen.push(
+            "<li class=\"" + (istOrdner ? "o" : "d") + "\">" +
+            "<a href=\"" + encodeURIComponent(eintrag.name) + (istOrdner ? "/" : "") + "\">" +
+            entschaerfen(eintrag.name) + (istOrdner ? "/" : "") + "</a>" +
+            "<span>" + groesse + "</span></li>"
+        );
+    }
+
+    const seite =
+        "<!doctype html><html lang=\"de\"><meta charset=\"utf-8\">" +
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
+        "<title>" + entschaerfen(urlPfad) + "</title>" +
+        "<style>" +
+        "body{font:15px/1.6 system-ui,-apple-system,sans-serif;max-width:52rem;" +
+        "margin:3rem auto;padding:0 1.5rem;color:#1d2430;background:#fff}" +
+        "h1{font-size:1.1rem;font-weight:600;margin:0 0 1.2rem;word-break:break-all}" +
+        "ul{list-style:none;padding:0;margin:0;border-top:1px solid #e6e8ed}" +
+        "li{display:flex;justify-content:space-between;gap:1rem;padding:.5rem .25rem;" +
+        "border-bottom:1px solid #e6e8ed}" +
+        "a{color:#1f5fb0;text-decoration:none;overflow-wrap:anywhere}" +
+        "a:hover{text-decoration:underline}li.o a{font-weight:600}" +
+        "span{color:#8a909c;white-space:nowrap;font-variant-numeric:tabular-nums}" +
+        "footer{margin-top:2rem;color:#8a909c;font-size:.83rem}" +
+        "@media(prefers-color-scheme:dark){body{background:#15171b;color:#e6e8ec}" +
+        "a{color:#7aa7ff}ul,li{border-color:#2b2f36}}" +
+        "</style>" +
+        "<h1>" + entschaerfen(decodeURIComponent(urlPfad)) + "</h1>" +
+        "<ul>" + (zeilen.join("") || "<li class=\"d\"><span>Der Ordner ist leer.</span></li>") + "</ul>" +
+        "<footer>Lokaler Webserver &middot; " + entschaerfen(WURZEL) + "</footer>";
+
+    antwort.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store"
+    });
+
+    antwort.end(seite);
+}
+
+/* ===== PHP ausfuehren ===== */
+
+function phpAusfuehren(anfrage, antwort, datei, urlPfad, abfrage) {
+
+    // PHP wird als CGI-Programm aufgerufen: Die Angaben zur Anfrage
+    // kommen ueber Umgebungsvariablen, der Anfragekoerper ueber die
+    // Standardeingabe. Zurueck kommen Kopfzeilen, eine Leerzeile und
+    // dann der Seiteninhalt.
+
+    const umgebung = Object.assign({}, process.env, {
+        GATEWAY_INTERFACE: "CGI/1.1",
+        SERVER_SOFTWARE: "LokalerWebserver",
+        SERVER_PROTOCOL: "HTTP/1.1",
+        SERVER_NAME: "localhost",
+        SERVER_PORT: String(EINSTELLUNGEN.port),
+        DOCUMENT_ROOT: WURZEL,
+        SCRIPT_FILENAME: datei,
+        SCRIPT_NAME: urlPfad,
+        REQUEST_URI: anfrage.url,
+        REQUEST_METHOD: anfrage.method,
+        QUERY_STRING: abfrage || "",
+        CONTENT_TYPE: anfrage.headers["content-type"] || "",
+        CONTENT_LENGTH: anfrage.headers["content-length"] || "",
+        REMOTE_ADDR: anfrage.socket.remoteAddress || "127.0.0.1",
+        HTTP_HOST: anfrage.headers.host || "localhost",
+
+        // Ohne diese Angabe verweigert php-cgi aus Sicherheitsgruenden
+        // den Dienst ("Security Alert: request not from CGI").
+        REDIRECT_STATUS: "200"
+    });
+
+    // Alle uebrigen Kopfzeilen der Anfrage weiterreichen
+    for (const [name, wert] of Object.entries(anfrage.headers)) {
+
+        const schluessel =
+            "HTTP_" + name.toUpperCase().replace(/-/g, "_");
+
+        if (!(schluessel in umgebung)) {
+            umgebung[schluessel] = Array.isArray(wert) ? wert.join(", ") : wert;
+        }
+    }
+
+    const kind =
+        spawn(PHP, [], { env: umgebung, cwd: path.dirname(datei) });
+
+    const teile = [];
+    const meldungen = [];
+
+    kind.stdout.on("data", function (teil) { teile.push(teil); });
+    kind.stderr.on("data", function (teil) { meldungen.push(teil); });
+
+    anfrage.pipe(kind.stdin);
+
+    kind.stdin.on("error", function () {
+        // Bricht PHP frueh ab, ist die Eingabe schon zu. Das ist in Ordnung.
+    });
+
+    kind.on("error", function (fehler) {
+
+        console.error("  PHP konnte nicht gestartet werden: " + fehler.message);
+
+        if (!antwort.headersSent) {
+            fehlerSeite(antwort, 500, "PHP konnte nicht gestartet werden",
+                        entschaerfen(fehler.message));
+        }
+    });
+
+    kind.on("close", function () {
+
+        if (antwort.headersSent) {
             return;
         }
 
-        antwort.writeHead(200, {
-            "Content-Type": MIME_TYPEN[path.extname(ziel).toLowerCase()] || "application/octet-stream",
-            "Cache-Control": "no-cache"
-        });
+        const ausgabe = Buffer.concat(teile);
+        const fehlertext = Buffer.concat(meldungen).toString("utf8").trim();
 
+        if (fehlertext) {
+            console.error("  PHP: " + fehlertext);
+        }
+
+        // Kopfzeilen vom Inhalt trennen
+        let trenner = ausgabe.indexOf("\r\n\r\n");
+        let laenge = 4;
+
+        if (trenner < 0) {
+            trenner = ausgabe.indexOf("\n\n");
+            laenge = 2;
+        }
+
+        if (trenner < 0) {
+
+            if (ausgabe.length === 0 && fehlertext) {
+                fehlerSeite(antwort, 500, "Fehler in PHP",
+                            "<code>" + entschaerfen(fehlertext) + "</code>");
+                return;
+            }
+
+            // Ohne Kopfzeilen alles als Seiteninhalt behandeln
+            antwort.writeHead(200, {
+                "Content-Type": "text/html; charset=utf-8",
+                "Cache-Control": "no-store"
+            });
+
+            antwort.end(ausgabe);
+            return;
+        }
+
+        const kopfText = ausgabe.slice(0, trenner).toString("utf8");
+        const inhalt = ausgabe.slice(trenner + laenge);
+
+        const kopfzeilen = {};
+        let status = 200;
+
+        for (const zeile of kopfText.split(/\r?\n/)) {
+
+            const doppelpunkt = zeile.indexOf(":");
+
+            if (doppelpunkt < 0) {
+                continue;
+            }
+
+            const name = zeile.slice(0, doppelpunkt).trim();
+            const wert = zeile.slice(doppelpunkt + 1).trim();
+
+            if (name.toLowerCase() === "status") {
+                status = parseInt(wert, 10) || 200;
+                continue;
+            }
+
+            // Mehrfache Kopfzeilen (etwa Set-Cookie) sammeln
+            if (kopfzeilen[name] === undefined) {
+                kopfzeilen[name] = wert;
+            } else if (Array.isArray(kopfzeilen[name])) {
+                kopfzeilen[name].push(wert);
+            } else {
+                kopfzeilen[name] = [kopfzeilen[name], wert];
+            }
+        }
+
+        if (!kopfzeilen["Content-Type"] && !kopfzeilen["content-type"]) {
+            kopfzeilen["Content-Type"] = "text/html; charset=utf-8";
+        }
+
+        kopfzeilen["Cache-Control"] = "no-store";
+
+        antwort.writeHead(status, kopfzeilen);
         antwort.end(inhalt);
     });
 }
 
-const server = http.createServer(function (anfrage, antwort) {
+/* ===== Datei ausliefern ===== */
 
-    const pfad =
-        anfrage.url.split("?")[0];
+function dateiSenden(anfrage, antwort, datei, angaben) {
 
-    if (pfad === "/api/version") {
-        jsonSenden(antwort, 200, { version: zustand.version });
+    const typ = typVon(datei);
+    const bereich = anfrage.headers.range;
+
+    // Teilbereiche werden fuer Video und Audio gebraucht: Der Browser
+    // fragt damit nur den Abschnitt an, den er gerade abspielt.
+    if (bereich) {
+
+        const treffer = /^bytes=(\d*)-(\d*)$/.exec(bereich.trim());
+
+        if (treffer) {
+
+            let von = treffer[1] === "" ? null : Number(treffer[1]);
+            let bis = treffer[2] === "" ? null : Number(treffer[2]);
+
+            if (von === null && bis !== null) {
+                von = Math.max(0, angaben.size - bis);
+                bis = angaben.size - 1;
+            } else {
+                if (von === null) { von = 0; }
+                if (bis === null || bis >= angaben.size) { bis = angaben.size - 1; }
+            }
+
+            if (von > bis || von >= angaben.size) {
+
+                antwort.writeHead(416, {
+                    "Content-Range": "bytes */" + angaben.size
+                });
+
+                antwort.end();
+                return;
+            }
+
+            antwort.writeHead(206, {
+                "Content-Type": typ,
+                "Content-Length": bis - von + 1,
+                "Content-Range": "bytes " + von + "-" + bis + "/" + angaben.size,
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "no-store"
+            });
+
+            if (anfrage.method === "HEAD") {
+                antwort.end();
+                return;
+            }
+
+            fs.createReadStream(datei, { start: von, end: bis }).pipe(antwort);
+            return;
+        }
+    }
+
+    antwort.writeHead(200, {
+        "Content-Type": typ,
+        "Content-Length": angaben.size,
+        "Accept-Ranges": "bytes",
+        "Last-Modified": angaben.mtime.toUTCString(),
+
+        // Beim Entwickeln soll ein Neuladen immer den neuen Stand zeigen
+        "Cache-Control": "no-store, must-revalidate"
+    });
+
+    if (anfrage.method === "HEAD") {
+        antwort.end();
         return;
     }
 
-    if (pfad === "/api/daten") {
-        jsonSenden(antwort, 200, sichtbarerStand(zustand));
+    const strom = fs.createReadStream(datei);
+
+    strom.on("error", function () {
+        antwort.destroy();
+    });
+
+    strom.pipe(antwort);
+}
+
+/* ===== Anfragen beantworten ===== */
+
+async function beantworten(anfrage, antwort) {
+
+    if (anfrage.method !== "GET" && anfrage.method !== "HEAD" && anfrage.method !== "POST") {
+        fehlerSeite(antwort, 405, "Nicht unterstützt",
+                    "Dieser Server beantwortet GET, HEAD und POST.");
         return;
     }
 
-    if (pfad === "/api/ereignisse") {
+    const zerlegt = url.parse(anfrage.url);
 
-        // Dauerhaft offene Verbindung. Der Server schickt hierueber jede
-        // Aenderung sofort an alle Browser - ohne dass die nachfragen muessen.
+    let urlPfad;
 
-        antwort.writeHead(200, {
-            "Content-Type": "text/event-stream; charset=utf-8",
-            "Cache-Control": "no-cache, no-transform",
-            "Connection": "keep-alive"
-        });
-
-        antwort.write("retry: 3000\n\n");
-        antwort.write("data: " + JSON.stringify({
-            art: "verbunden",
-            version: zustand.version
-        }) + "\n\n");
-
-        zuhoerer.add(antwort);
-
-        // Lebenszeichen, damit Zwischenstellen die Verbindung nicht kappen
-        const puls =
-            setInterval(function () {
-                try {
-                    antwort.write(": puls\n\n");
-                } catch (fehler) {
-                    zuhoerer.delete(antwort);
-                }
-            }, 25000);
-
-        anfrage.on("close", function () {
-            clearInterval(puls);
-            zuhoerer.delete(antwort);
-        });
-
+    try {
+        urlPfad = decodeURIComponent(zerlegt.pathname);
+    } catch (fehler) {
+        fehlerSeite(antwort, 400, "Fehlerhafte Adresse", "Die Adresse ist nicht lesbar.");
         return;
     }
 
-    if (pfad === "/api/aktion") {
+    const ziel = path.resolve(WURZEL, "." + urlPfad);
 
-        if (anfrage.method !== "POST") {
-            jsonSenden(antwort, 405, { fehler: "Nur POST." });
+    // Nichts ausserhalb des Ordners ausliefern
+    if (ziel !== WURZEL && !ziel.startsWith(WURZEL + path.sep)) {
+        fehlerSeite(antwort, 403, "Kein Zugriff",
+                    "Diese Adresse liegt ausserhalb des ausgelieferten Ordners.");
+        return;
+    }
+
+    if (istGeschuetzt(ziel)) {
+        fehlerSeite(antwort, 403, "Kein Zugriff",
+                    "Datenbanken und Einstellungsdateien werden nicht ausgeliefert.<br><br>" +
+                    "Die Datei liegt weiterhin im Ordner und kann von PHP " +
+                    "ganz normal geoeffnet werden - nur ueber den Browser " +
+                    "herunterladen laesst sie sich nicht.");
+        return;
+    }
+
+    let angaben;
+
+    try {
+        angaben = await fsp.stat(ziel);
+    } catch (fehler) {
+        fehlerSeite(antwort, 404, "Nicht gefunden",
+                    "<code>" + entschaerfen(urlPfad) + "</code> gibt es in " +
+                    "<code>" + entschaerfen(path.basename(WURZEL)) + "</code> nicht.");
+        return;
+    }
+
+    if (angaben.isDirectory()) {
+
+        // Ohne Schrägstrich am Ende zeigen relative Verweise ins Leere
+        if (!urlPfad.endsWith("/")) {
+            antwort.writeHead(301, { "Location": urlPfad + "/" + (zerlegt.search || "") });
+            antwort.end();
             return;
         }
 
-        // Kennung des Browsers, der die Aenderung ausloest. Damit bekommt
-        // genau dieser keine Benachrichtigung ueber die eigene Aktion.
-        let aktionAbsender = null;
+        for (const name of ["index.html", "index.htm", "index.php"]) {
 
-        koerperLesen(anfrage)
-            .then(function (aktion) {
+            const startseite = path.join(ziel, name);
 
-                aktionAbsender =
-                    typeof aktion.absender === "string" ? aktion.absender : null;
+            if (fs.existsSync(startseite)) {
 
-                return inWarteschlange(async function () {
+                if (name.endsWith(".php")) {
 
-                    // Zuerst den Stand von der Platte holen. Ein anderer
-                    // Arbeitsplatz kann inzwischen etwas geaendert haben.
-                    vonPlatteAuffrischen();
+                    if (!PHP) {
+                        phpFehlt(antwort);
+                        return;
+                    }
 
-                    const entwurf =
-                        structuredClone(zustand);
-
-                    const meldung =
-                        aktionAnwenden(entwurf, aktion);
-
-                    entwurf.version += 1;
-
-                    // Erst schreiben, dann gilt der neue Stand. Sonst
-                    // koennten Arbeitsspeicher und Datei auseinanderlaufen.
-                    await zustandSchreiben(entwurf);
-
-                    zustand = entwurf;
-
-                    await backupSchreiben();
-
-                    return { zustand: zustand, meldung: meldung };
-                });
-            })
-            .then(function (ergebnis) {
-
-                console.log(new Date().toLocaleTimeString("de-DE") +
-                            "  " + ergebnis.meldung);
-
-                const sichtbar =
-                    sichtbarerStand(ergebnis.zustand);
-
-                jsonSenden(antwort, 200, sichtbar);
-
-                // Erst antworten, dann alle anderen Browser benachrichtigen
-                anAlleVerteilen({
-                    art: "aenderung",
-                    meldung: ergebnis.meldung,
-                    absender: aktionAbsender,
-                    zustand: sichtbar
-                });
-            })
-            .catch(function (fehler) {
-
-                const status =
-                    fehler.status || 500;
-
-                if (status >= 500) {
-                    console.error("Fehler:", fehler);
+                    phpAusfuehren(anfrage, antwort, startseite,
+                                  urlPfad + name, (zerlegt.query || ""));
+                    return;
                 }
 
-                jsonSenden(antwort, status, { fehler: fehler.message });
-            });
+                dateiSenden(anfrage, antwort, startseite, await fsp.stat(startseite));
+                return;
+            }
+        }
 
+        await verzeichnisAnzeigen(antwort, ziel, urlPfad);
         return;
     }
 
-    if (anfrage.method !== "GET") {
-        antwort.writeHead(405).end("Nur GET");
+    if (path.extname(ziel).toLowerCase() === ".php") {
+
+        if (!PHP) {
+            phpFehlt(antwort);
+            return;
+        }
+
+        phpAusfuehren(anfrage, antwort, ziel, urlPfad, (zerlegt.query || ""));
         return;
     }
 
-    dateiAusliefern(antwort, pfad);
+    dateiSenden(anfrage, antwort, ziel, angaben);
+}
+
+function phpFehlt(antwort) {
+
+    fehlerSeite(antwort, 501, "PHP ist nicht eingerichtet",
+                "Diese Seite ist eine PHP-Datei, aber es wurde kein PHP gefunden.<br><br>" +
+                "Am einfachsten: PHP herunterladen und den entpackten Ordner als " +
+                "<code>php</code> neben den Server legen, sodass es " +
+                "<code>php/php-cgi.exe</code> gibt. Dann den Server neu starten.");
+}
+
+/* ===== Server ===== */
+
+const server = http.createServer(function (anfrage, antwort) {
+
+    const beginn = Date.now();
+
+    antwort.on("finish", function () {
+
+        const zeit = new Date().toLocaleTimeString("de-DE");
+
+        console.log("  " + zeit + "  " + antwort.statusCode + "  " +
+                    anfrage.method + " " + anfrage.url +
+                    "  (" + (Date.now() - beginn) + " ms)");
+    });
+
+    beantworten(anfrage, antwort).catch(function (fehler) {
+
+        console.error("  Fehler:", fehler.message);
+
+        if (!antwort.headersSent) {
+            fehlerSeite(antwort, 500, "Fehler im Server", entschaerfen(fehler.message));
+        } else {
+            antwort.destroy();
+        }
+    });
 });
 
-/* ===== Protokoll ===== */
+/* ===== Browser oeffnen ===== */
 
-const LOG_DATEI = path.join(DATEN_ORDNER, "server-log-" + os.hostname().toLowerCase() + ".txt");
+function browserOeffnen(adresse) {
 
-function protokollZeile(text) {
+    if (EINSTELLUNGEN.keinBrowser) {
+        return;
+    }
+
+    const aufruf =
+        process.platform === "win32"  ? { befehl: "cmd",      argumente: ["/c", "start", "", adresse] } :
+        process.platform === "darwin" ? { befehl: "open",     argumente: [adresse] } :
+                                        { befehl: "xdg-open", argumente: [adresse] };
 
     try {
 
-        fs.mkdirSync(DATEN_ORDNER, { recursive: true });
-
-        // Wird die Datei zu gross, mit dem aktuellen Lauf neu anfangen
-        if (fs.existsSync(LOG_DATEI) && fs.statSync(LOG_DATEI).size > 1024 * 1024) {
-            fs.writeFileSync(LOG_DATEI, "", "utf8");
-        }
-
-        fs.appendFileSync(LOG_DATEI, text + "\r\n", "utf8");
+        spawn(aufruf.befehl, aufruf.argumente, {
+            detached: true,
+            stdio: "ignore",
+            windowsHide: true
+        }).unref();
 
     } catch (fehler) {
-        // Das Protokoll ist Beiwerk und darf den Betrieb nie stoeren
+        // Kein Browser da - der Server laeuft trotzdem
     }
 }
 
-function protokollAnschliessen() {
+/* ===== Netzwerkadresse ===== */
 
-    const inspect = require("util").inspect;
+function netzwerkAdresse() {
 
-    const zuText = function (teile) {
-        return teile
-            .map(function (t) { return typeof t === "string" ? t : inspect(t); })
-            .join(" ");
-    };
+    const schnittstellen = require("os").networkInterfaces();
 
-    const echtesLog = console.log;
-    const echtesError = console.error;
-    const echtesWarn = console.warn;
+    for (const liste of Object.values(schnittstellen)) {
+        for (const eintrag of liste || []) {
+            if (eintrag.family === "IPv4" && !eintrag.internal) {
+                return eintrag.address;
+            }
+        }
+    }
 
-    console.log = function () {
-        const text = zuText([].slice.call(arguments));
-        echtesLog(text);
-        protokollZeile(text);
-    };
-
-    console.error = function () {
-        const text = zuText([].slice.call(arguments));
-        echtesError(text);
-        protokollZeile("FEHLER  " + text);
-    };
-
-    console.warn = function () {
-        const text = zuText([].slice.call(arguments));
-        echtesWarn(text);
-        protokollZeile("WARNUNG " + text);
-    };
+    return null;
 }
 
 /* ===== Start ===== */
 
-function browserOeffnen(adresse) {
+function starten(port, versuche) {
 
-    // Abschalten, indem eine leere Datei "kein-browser.txt" angelegt wird
-    if (process.env.KEIN_BROWSER === "1" ||
-        fs.existsSync(path.join(ORDNER, "kein-browser.txt"))) {
-        return;
-    }
+    server.listen(port, ADRESSE);
 
-    const ziel =
-        adresse || ("http://localhost:" + PORT);
+    server.once("error", function (fehler) {
 
-    // Windows startet ueber cmd, macOS ueber open, Linux ueber xdg-open.
-    const aufruf =
-        process.platform === "win32"  ? { befehl: "cmd",      argumente: ["/c", "start", "", ziel] } :
-        process.platform === "darwin" ? { befehl: "open",     argumente: [ziel] } :
-                                        { befehl: "xdg-open", argumente: [ziel] };
+        if (fehler.code === "EADDRINUSE" && versuche > 0) {
 
-    try {
+            console.log("  Port " + port + " ist belegt, versuche " + (port + 1) + " ...");
 
-        require("child_process")
-            .spawn(aufruf.befehl, aufruf.argumente, {
-                detached: true,
-                stdio: "ignore",
-                windowsHide: true
-            })
-            .unref();
+            setTimeout(function () { starten(port + 1, versuche - 1); }, 50);
+            return;
+        }
 
-    } catch (fehler) {
-        console.warn("Browser konnte nicht geoeffnet werden:", fehler.message);
-    }
-}
+        if (fehler.code === "EADDRINUSE") {
+            console.error("");
+            console.error("  Es ist kein freier Port zu finden.");
+            console.error("  In \"einstellungen.txt\" eine andere Zahl bei \"port\" eintragen.");
+        } else if (fehler.code === "EACCES") {
 
-function startmeldung() {
+            console.error("");
+            console.error("  Port " + port + " darf so nicht verwendet werden.");
+            console.error("");
 
-    console.log("");
-    console.log("  ============================================================");
-    console.log("   URLAUBSKALENDER laeuft");
-    console.log("  ============================================================");
-    console.log("");
-    console.log("     http://localhost:" + PORT);
-    console.log("");
-    console.log("   Gemeinsame Datei:");
-    console.log("   " + DATEN_DATEI);
-    console.log("");
-    console.log("   Aenderungen der Kolleginnen und Kollegen werden");
-    console.log("   automatisch uebernommen, sobald der MERKUR drive sie");
-    console.log("   hergebracht hat.");
-    console.log("");
-    console.log("   Zum Beenden dieses Fenster schliessen oder Strg+C druecken.");
-    console.log("  ============================================================");
-    console.log("");
+            if (port < 1024 && process.platform !== "win32") {
+                console.error("  Ports unter 1024 sind auf diesem System besonders");
+                console.error("  geschuetzt. Zwei Moeglichkeiten:");
+                console.error("");
+                console.error("    1. In \"einstellungen.txt\" einen hoeheren Port");
+                console.error("       eintragen, zum Beispiel 8080.");
+                console.error("    2. Den Server mit erweiterten Rechten starten:");
+                console.error("       sudo node server.js");
+            } else if (port === 80) {
+                console.error("  Port 80 ist auf diesem Rechner belegt - haeufig durch");
+                console.error("  IIS, einen anderen Webserver oder Skype.");
+                console.error("  In \"einstellungen.txt\" zum Beispiel 8080 eintragen.");
+            } else {
+                console.error("  In \"einstellungen.txt\" einen anderen Port eintragen.");
+            }
 
-    browserOeffnen();
-}
+        } else {
+            console.error("  Fehler:", fehler.message);
+        }
 
-function starten() {
-
-    const vonPlatte =
-        vonPlatteLesen();
-
-    zustand = altesAufraeumen(vonPlatte || { version: 0, mitarbeiter: [], eintraege: [] });
-    zustand.version = 1;
-
-    zuletztGeschrieben = standFingerabdruck(zustand);
-
-    console.log("Geladen: " + lebendeMitarbeiter(zustand).length + " Mitarbeiter, " +
-                lebendeEintraege(zustand).length + " Eintraege");
-
-    server.listen(PORT, "127.0.0.1", function () {
-        dateiUeberwachen();
-        startmeldung();
+        process.exitCode = 1;
     });
 }
 
-server.on("error", function (fehler) {
+server.on("listening", function () {
 
-    if (fehler.code === "EADDRINUSE") {
-        console.log("");
-        console.log("  Der Urlaubskalender laeuft auf diesem Rechner bereits.");
-        console.log("  Er wird im Browser geoeffnet.");
-        console.log("");
+    const port = server.address().port;
 
-        browserOeffnen();
+    // Bei Port 80 gehoert keine Portangabe in die Adresse
+    const adresse =
+        port === 80 ? "http://localhost/" : "http://localhost:" + port + "/";
 
-        process.exit(0);
+    console.log("");
+    console.log("  ======================================================");
+    console.log("   LOKALER WEBSERVER laeuft");
+    console.log("  ======================================================");
+    console.log("");
+    console.log("   Adresse   " + adresse);
+
+    if (EINSTELLUNGEN.imNetzwerk) {
+
+        const ip = netzwerkAdresse();
+
+        if (ip) {
+            console.log("   Im Netz   http://" + ip + ":" + port + "/");
+        }
     }
 
-    console.error("  FEHLER:", fehler.message);
-    process.exitCode = 1;
+    console.log("   Ordner    " + WURZEL);
+
+    if (PHP) {
+
+        const koennen = phpFaehigkeiten();
+
+        console.log("   PHP       " +
+                    (koennen && koennen.version ? koennen.version + "  " : "") + PHP);
+
+        console.log("   SQLite    " +
+                    (koennen === null ? "unbekannt"
+                                      : koennen.sqlite ? "einsatzbereit"
+                                                       : "aus - siehe php.ini"));
+
+    } else {
+        console.log("   PHP       nicht gefunden - HTML, CSS, Bilder gehen trotzdem");
+        console.log("   SQLite    braucht PHP");
+    }
+
+    console.log("");
+
+    if (port !== EINSTELLUNGEN.port) {
+        console.log("   Hinweis: Port " + EINSTELLUNGEN.port + " war belegt.");
+        console.log("");
+    }
+
+    if (EINSTELLUNGEN.imNetzwerk) {
+        console.log("   Achtung: Der Ordner ist fuer alle Geraete im Netzwerk");
+        console.log("   erreichbar.");
+        console.log("");
+    }
+
+    console.log("   Zum Beenden dieses Fenster schliessen oder Strg+C");
+    console.log("  ======================================================");
+    console.log("");
+
+    browserOeffnen(adresse);
 });
 
-protokollAnschliessen();
+if (!fs.existsSync(WURZEL)) {
 
-console.log("");
-console.log("--- Start " + new Date().toLocaleString("de-DE") + " ---");
+    try {
 
-starten();
+        fs.mkdirSync(WURZEL, { recursive: true });
+
+        console.log("");
+        console.log("  Der Ordner \"" + EINSTELLUNGEN.ordner + "\" war nicht da und wurde angelegt.");
+        console.log("  Die eigenen Seiten gehoeren dort hinein.");
+
+    } catch (fehler) {
+        console.error("");
+        console.error("  Der Ordner \"" + WURZEL + "\" laesst sich nicht anlegen:");
+        console.error("  " + fehler.message);
+        process.exit(1);
+    }
+}
+
+phpIniSicherstellen();
+
+process.on("SIGINT", function () {
+    console.log("\n  Der Webserver wurde beendet.\n");
+    process.exit(0);
+});
+
+starten(EINSTELLUNGEN.port, 20);
