@@ -9,6 +9,10 @@ Der Ordner darf verschoben, kopiert oder im Drive abgelegt werden -
 der Server findet sich immer selbst.
 
 
+Eine bebilderte Anleitung mit Bildschirmfotos steht in "Anleitung.html" -
+einfach doppelklicken. Der Text hier ist die Kurzfassung.
+
+
 STARTEN
 -------
 
@@ -106,6 +110,8 @@ WAS IM ORDNER LIEGEN MUSS
   www\                  die eigenen Seiten
   php\                  nur noetig, wenn PHP verwendet wird
   einstellungen.txt     legt der Server selbst an
+
+  Anleitung.html        die bebilderte Anleitung
 
   Webserver starten.vbs
   Webserver mit Fenster starten.cmd

@@ -9,6 +9,11 @@ starten. Installiert werden muss nichts: `node.exe` liegt einfach daneben.
 Alle Pfade sind relativ zum Server, der Ordner darf also beliebig verschoben
 oder kopiert werden.
 
+Eine bebilderte Schritt-für-Schritt-Anleitung für alle, die den Server nur
+benutzen wollen, liegt als `Anleitung.html` dabei – einfach doppelklicken. Sie
+enthält ihre Bilder selbst und funktioniert deshalb auch ohne Internet und
+weitergegeben als einzelne Datei.
+
 ## Starten
 
 | Datei | |
@@ -102,6 +107,7 @@ lokaler-webserver/
 │   └── test.php                       Selbsttest, darf weg
 ├── daten/                             guter Platz für SQLite-Dateien
 ├── einstellungen.txt                  legt der Server selbst an
+├── Anleitung.html                     bebilderte Anleitung, per Doppelklick
 ├── Webserver starten.vbs
 ├── Webserver mit Fenster starten.cmd
 ├── Webserver beenden.cmd
