@@ -73,6 +73,57 @@ Start angelegt. Nach einer Aenderung den Server neu starten.
 
   ordnerliste = ja  Ordnerinhalt anzeigen, wenn keine index.html da ist.
 
+  https = nein      Bei "ja" laeuft der Server verschluesselt ueber
+                    https://. Siehe unten "HTTPS".
+
+
+HTTPS
+-----
+
+In "einstellungen.txt":
+
+  https = ja
+  port  = 443
+
+Dann ist der Server unter  https://localhost  erreichbar. Wer die
+alte http://-Adresse aufruft, wird von selbst umgeleitet.
+
+Ohne weiteres Zutun erstellt der Server beim Start selbst ein
+Zertifikat und legt es in den Ordner "zertifikat". Der Browser warnt
+dann zunaechst ("Verbindung ist nicht privat"), weil er dem Zertifikat
+noch nicht vertraut. Das aendert sich, sobald das Stammzertifikat
+einmal auf dem Geraet installiert ist:
+
+  Windows:  "zertifikat\stammzertifikat.crt" doppelklicken,
+            "Zertifikat installieren", Speicherort "Lokaler Computer",
+            Speicher "Vertrauenswuerdige Stammzertifizierungsstellen".
+            In einer Domaene kann die IT das per Gruppenrichtlinie fuer
+            alle Rechner auf einmal erledigen.
+
+  iPad und iPhone:
+            In Safari  https://<Adresse des Servers>/_zertifikat  oeffnen,
+            die Warnung bestaetigen und das Profil laden. Dann
+            Einstellungen > Profil geladen > Installieren, und danach
+            Einstellungen > Allgemein > Info > Zertifikatsvertrauens-
+            einstellungen > das Zertifikat einschalten.
+
+Das Stammzertifikat bleibt zehn Jahre gueltig. Das eigentliche
+Server-Zertifikat erneuert der Server selbst, etwa wenn sich seine
+IP-Adresse aendert - auf den Geraeten muss dann nichts neu installiert
+werden.
+
+Die Dateien mit der Endung ".key" im Ordner "zertifikat" sind geheim.
+Sie duerfen nicht weitergegeben werden.
+
+Hat die IT ein eigenes Zertifikat ausgestellt (empfohlen in Firmen,
+dann warnt kein Browser), wird es so eingetragen:
+
+  zertifikat = zertifikat\server.pfx
+  zertifikat-passwort = ...
+
+Statt einer .pfx-Datei geht auch eine .crt-Datei mit einer
+gleichnamigen .key-Datei daneben.
+
 
 PHP UND SQLITE
 --------------

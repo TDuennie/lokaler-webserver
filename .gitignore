@@ -15,6 +15,12 @@ daten/
 # Wird beim ersten Start selbst angelegt
 einstellungen.txt
 
+# HTTPS-Zertifikate - die Schluessel darin sind geheim
+zertifikat/
+*.key
+*.pfx
+*.p12
+
 # Aeltere Einzeleinstellungen
 port.txt
 ordner.txt
