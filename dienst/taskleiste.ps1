@@ -16,9 +16,9 @@ Add-Type -AssemblyName System.Drawing
 
 $neustartDatei = Join-Path $Protokolle "neustart"
 
-# Nur ein Symbol je Benutzer
+# Nur ein Symbol je Benutzer und Ordner - laufen zwei Webserver, gibt es zwei
 $erstes = $false
-$Script:Sperre = [System.Threading.Mutex]::new($true, "Local\LokalerWebserverSymbol", [ref]$erstes)
+$Script:Sperre = [System.Threading.Mutex]::new($true, "Local\LokalerWebserverSymbol_$OrdnerKennung", [ref]$erstes)
 if (-not $erstes) { exit }
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -50,7 +50,7 @@ $Script:Punkte = @{
 
 $Script:Symbol = New-Object System.Windows.Forms.NotifyIcon
 $Symbol.Icon = $Punkte.aus
-$Symbol.Text = "Webserver"
+$Symbol.Text = "Webserver $Name"
 $Symbol.Visible = $true
 
 # --- Zustand lesen -----------------------------------------------------
@@ -101,7 +101,7 @@ function Update-Symbol {
     $Script:Status = $neu.Status
     $Script:Anzeige = $neu
 
-    $text = "Webserver: " + $neu.Text
+    $text = "Webserver $($Name): " + $neu.Text
 
     # Mehr als 63 Zeichen nimmt Windows hier nicht
     if ($text.Length -gt 63) { $text = $text.Substring(0, 63) }
@@ -110,13 +110,13 @@ function Update-Symbol {
     $Symbol.Text = $text
 
     if ($vorher -eq "laeuft" -and $neu.Art -eq "gestoert") {
-        $Symbol.ShowBalloonTip(8000, "Webserver gestoert",
+        $Symbol.ShowBalloonTip(8000, "Webserver $Name gestoert",
             "Der Webserver antwortet nicht. Er wird automatisch neu gestartet.",
             [System.Windows.Forms.ToolTipIcon]::Warning)
     }
 
     if ($vorher -eq "gestoert" -and $neu.Art -eq "laeuft") {
-        $Symbol.ShowBalloonTip(5000, "Webserver",
+        $Symbol.ShowBalloonTip(5000, "Webserver $Name",
             "Der Webserver laeuft wieder.",
             [System.Windows.Forms.ToolTipIcon]::Info)
     }
@@ -143,12 +143,12 @@ function Request-Neustart {
 
         try {
             New-Item -Path $neustartDatei -ItemType File -Force | Out-Null
-            $Symbol.ShowBalloonTip(4000, "Webserver", "Der Webserver wird neu gestartet.",
+            $Symbol.ShowBalloonTip(4000, "Webserver $Name", "Der Webserver wird neu gestartet.",
                 [System.Windows.Forms.ToolTipIcon]::Info)
         } catch {
             [System.Windows.Forms.MessageBox]::Show(
                 "Der Neustart liess sich nicht anfordern:`n`n" + $_.Exception.Message,
-                "Webserver") | Out-Null
+                "Webserver $Name") | Out-Null
         }
 
         return
@@ -159,7 +159,7 @@ function Request-Neustart {
     try {
         Start-Process -FilePath "schtasks.exe" -ArgumentList "/run /tn `"$Aufgabe`"" `
                       -Verb RunAs -WindowStyle Hidden
-        $Symbol.ShowBalloonTip(4000, "Webserver", "Der Webserver wird gestartet.",
+        $Symbol.ShowBalloonTip(4000, "Webserver $Name", "Der Webserver wird gestartet.",
             [System.Windows.Forms.ToolTipIcon]::Info)
     } catch {
         # Abgebrochen
@@ -171,7 +171,7 @@ function Open-Protokoll {
     if (Test-Path $LogDatei) {
         Start-Process notepad.exe -ArgumentList "`"$LogDatei`""
     } else {
-        [System.Windows.Forms.MessageBox]::Show("Es gibt noch kein Protokoll.", "Webserver") | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("Es gibt noch kein Protokoll.", "Webserver $Name") | Out-Null
     }
 }
 

@@ -64,6 +64,17 @@ Tipp: Fuer den Dauerbetrieb den Ordner nicht auf dem Desktop lassen,
 sondern zum Beispiel nach C:\Webserver legen - vorher "Dienst
 entfernen.cmd", danach dort neu einrichten.
 
+Mehrere Webserver auf einem Rechner gehen auch: jeder in seinem eigenen
+Ordner, jeder mit eigenem Port und Namen in seiner einstellungen.txt,
+zum Beispiel
+
+  C:\Webserver\Planer IT    port = 8080    name = Planer IT
+  C:\Webserver\Planer HR    port = 8081    name = Planer HR
+
+und in jedem Ordner einmal "Als Dienst einrichten.cmd". Jeder bekommt
+sein eigenes Symbol. Beenden und Entfernen betreffen immer nur den
+Server aus dem eigenen Ordner.
+
 
 EIGENE SEITEN
 -------------

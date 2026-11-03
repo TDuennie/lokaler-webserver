@@ -183,6 +183,30 @@ Gesundheitsprüfung für einen Proxy oder Load Balancer.
 Der Ordner sollte dafür nicht in einem Benutzerprofil liegen (Desktop,
 Dokumente), sondern zum Beispiel unter `C:\Webserver`.
 
+### Mehrere Webserver auf einem Rechner
+
+Jeder Ordner ist ein eigener Webserver. Mehrere laufen nebeneinander, wenn
+jeder in seiner `einstellungen.txt` einen eigenen Port hat:
+
+```
+C:\Webserver\Planer IT\    port = 8080   name = Planer IT
+C:\Webserver\Planer HR\    port = 8081   name = Planer HR
+```
+
+In jedem Ordner einmal `Als Dienst einrichten.cmd`. Alles hängt am Ordner:
+
+- die Aufgabe heißt `Lokaler Webserver - <name>` (ohne `name =` gilt der
+  Ordnername; gibt es den Namen schon für einen anderen Ordner, bricht die
+  Einrichtung mit einem Hinweis ab),
+- die Firewall-Regel gilt nur für den eigenen Port,
+- jeder bekommt sein eigenes Symbol in der Taskleiste,
+- `Webserver beenden.cmd` und `Dienst entfernen.cmd` treffen nur den Server
+  aus dem eigenen Ordner – erkannt am vollen Pfad von `server.js` bzw.
+  `waechter.js` in der Befehlszeile.
+
+Ist der Port beim Einrichten schon belegt, sagt die Einrichtung, von wem,
+und richtet nichts ein.
+
 ## HTTPS
 
 ```ini
