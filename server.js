@@ -20,10 +20,14 @@ const http = require("http");
 const fs   = require("fs");
 const fsp  = require("fs/promises");
 const path = require("path");
-const url  = require("url");
 const { spawn } = require("child_process");
 
 const ORDNER = __dirname;
+
+// Laeuft der Server unter dem Waechter (waechter.js), besteht eine
+// Verbindung zu ihm: Darueber meldet er sich bereit, und endet sie,
+// beendet er sich ebenfalls.
+const UNTER_WAECHTER = typeof process.send === "function";
 
 /* ===== Einstellungen ===== */
 
@@ -1248,11 +1252,12 @@ async function beantworten(anfrage, antwort) {
         return;
     }
 
-    const zerlegt = url.parse(anfrage.url);
-
+    let zerlegt;
     let urlPfad;
 
     try {
+        // Vorangestellt statt als Basis, damit "//pfad" ein Pfad bleibt
+        zerlegt = new URL("http://localhost" + anfrage.url);
         urlPfad = decodeURIComponent(zerlegt.pathname);
     } catch (fehler) {
         fehlerSeite(antwort, 400, "Fehlerhafte Adresse", "Die Adresse ist nicht lesbar.");
@@ -1292,7 +1297,7 @@ async function beantworten(anfrage, antwort) {
 
         // Ohne Schrägstrich am Ende zeigen relative Verweise ins Leere
         if (!urlPfad.endsWith("/")) {
-            antwort.writeHead(301, { "Location": urlPfad + "/" + (zerlegt.search || "") });
+            antwort.writeHead(301, { "Location": encodeURI(urlPfad + "/") + zerlegt.search });
             antwort.end();
             return;
         }
@@ -1311,7 +1316,7 @@ async function beantworten(anfrage, antwort) {
                     }
 
                     phpAusfuehren(anfrage, antwort, startseite,
-                                  urlPfad + name, (zerlegt.query || ""));
+                                  urlPfad + name, zerlegt.search.slice(1));
                     return;
                 }
 
@@ -1331,7 +1336,7 @@ async function beantworten(anfrage, antwort) {
             return;
         }
 
-        phpAusfuehren(anfrage, antwort, ziel, urlPfad, (zerlegt.query || ""));
+        phpAusfuehren(anfrage, antwort, ziel, urlPfad, zerlegt.search.slice(1));
         return;
     }
 
@@ -1349,9 +1354,24 @@ function phpFehlt(antwort) {
 
 /* ===== Server ===== */
 
+const STATUS_PFAD = "/_status";
+const GESTARTET = new Date().toISOString();
+
 function anfrageBearbeiten(anfrage, antwort) {
 
     const beginn = Date.now();
+
+    // Lebenszeichen fuer den Waechter und den Proxy der IT
+    if (anfrage.url === STATUS_PFAD) {
+
+        antwort.writeHead(200, {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store"
+        });
+
+        antwort.end(JSON.stringify({ status: "ok", seit: GESTARTET }));
+        return;
+    }
 
     antwort.on("finish", function () {
 
@@ -1530,7 +1550,9 @@ function starten(port, versuche) {
             return;
         }
 
-        if (fehler.code === "EADDRINUSE") {
+        if (fehler.code === "EADDRINUSE" && UNTER_WAECHTER) {
+            console.error("  Port " + port + " ist belegt - laeuft der Webserver noch ein zweites Mal?");
+        } else if (fehler.code === "EADDRINUSE") {
             console.error("");
             console.error("  Es ist kein freier Port zu finden.");
             console.error("  In \"einstellungen.txt\" eine andere Zahl bei \"port\" eintragen.");
@@ -1561,12 +1583,22 @@ function starten(port, versuche) {
         }
 
         process.exitCode = 1;
+
+        // Unter dem Waechter haelt die Verbindung zu ihm den Prozess am
+        // Leben - also ausdruecklich beenden, er versucht es dann erneut
+        if (UNTER_WAECHTER) {
+            process.exit(1);
+        }
     });
 }
 
 server.on("listening", function () {
 
     const port = server.address().port;
+
+    if (UNTER_WAECHTER) {
+        process.send({ bereit: true, port: port, schema: SCHEMA });
+    }
 
     // Beim ueblichen Port gehoert keine Portangabe in die Adresse
     const ohnePort = port === (TLS ? 443 : 80);
@@ -1673,4 +1705,36 @@ process.on("SIGINT", function () {
     process.exit(0);
 });
 
-starten(EINSTELLUNGEN.port, 20);
+if (UNTER_WAECHTER) {
+    process.on("disconnect", function () { process.exit(0); });
+}
+
+// Laeuft der Server schon als Dienst unter dem Waechter, keinen zweiten
+// daneben starten - nur den Browser auf den laufenden oeffnen
+if (!UNTER_WAECHTER) {
+
+    try {
+
+        const dienst = JSON.parse(
+            fs.readFileSync(path.join(ORDNER, "protokoll", "status.json"), "utf8"));
+
+        if (dienst.zustand === "laeuft" && Date.now() - dienst.aktualisiertMs < 30 * 1000) {
+
+            const adresse = dienst.schema + "://localhost:" + dienst.port + "/";
+
+            console.log("");
+            console.log("  Der Webserver laeuft bereits als Dienst:  " + adresse);
+            console.log("");
+
+            browserOeffnen(adresse);
+            process.exit(0);
+        }
+
+    } catch (fehler) {
+        // Kein Dienst eingerichtet - ganz normal starten
+    }
+}
+
+// Unter dem Waechter bleibt es beim eingestellten Port - der Proxy der IT
+// erwartet ihn dort. Ist er belegt, versucht es der Waechter spaeter erneut.
+starten(EINSTELLUNGEN.port, UNTER_WAECHTER ? 0 : 20);

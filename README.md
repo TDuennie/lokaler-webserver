@@ -22,6 +22,8 @@ weitergegeben als einzelne Datei.
 | `Webserver mit Fenster starten.cmd` | Windows, mit allen Meldungen |
 | `Webserver beenden.cmd` | beendet den laufenden Server |
 | `Webserver starten.command` | macOS und Linux |
+| `Als Dienst einrichten.cmd` | Windows: startet mit Windows, überwacht, Symbol in der Taskleiste |
+| `Dienst entfernen.cmd` | nimmt das wieder heraus |
 
 Oder direkt:
 
@@ -147,6 +149,40 @@ er dort häufig durch IIS oder Skype. Unter macOS und Linux sind Ports unter
 1024 geschützt, dort braucht es `sudo node server.js`. In beiden Fällen sagt
 der Server beim Start, was zu tun ist.
 
+## Als Dienst auf einem Windows-Server
+
+Für den Dauerbetrieb: `Als Dienst einrichten.cmd` doppelklicken und die
+Abfrage nach Administratorrechten bestätigen. Danach
+
+- **startet der Server mit Windows**, auch ohne dass jemand angemeldet ist –
+  über eine Aufgabe „Lokaler Webserver“ in der Aufgabenplanung, die als
+  SYSTEM läuft,
+- **passt ein Wächter auf ihn auf** (`waechter.js`): Stürzt der Server ab,
+  startet er ihn neu. Alle 30 Sekunden fragt er unter `/_status` nach;
+  bleibt die Antwort zweimal aus, gilt der Server als hängend und wird
+  ebenfalls neu gestartet. Stürzt er gleich wieder ab, wartet der Wächter
+  jedes Mal doppelt so lange, höchstens eine Minute. Fällt der Wächter
+  selbst aus, startet ihn Windows nach einer Minute neu.
+- **zeigt ein Symbol in der Taskleiste** den Zustand – grün läuft, gelb
+  startet, rot gestört, grau aus. Bei einer Störung kommt eine
+  Benachrichtigung. Rechtsklick: im Browser öffnen, neu starten, Protokoll
+  anzeigen. Das Symbol startet bei jeder Anmeldung, für alle Benutzer.
+- **steht alles im Protokoll** `protokoll/server.log`, mit Uhrzeit. Ab 5 MB
+  wird es weitergeschoben, die letzten drei bleiben.
+- ist bei `netzwerk = ja` der Port in der **Windows-Firewall** freigegeben
+  (Domäne und privat).
+
+Unter dem Wächter bleibt der Server beim eingestellten Port, statt auf den
+nächsten freien auszuweichen – ein Proxy davor erwartet ihn dort. Wird
+`Webserver starten.vbs` doppelgeklickt, während der Dienst läuft, öffnet
+sich nur der Browser auf den laufenden Server.
+
+`/_status` antwortet mit `{"status":"ok", …}` und eignet sich auch als
+Gesundheitsprüfung für einen Proxy oder Load Balancer.
+
+Der Ordner sollte dafür nicht in einem Benutzerprofil liegen (Desktop,
+Dokumente), sondern zum Beispiel unter `C:\Webserver`.
+
 ## HTTPS
 
 ```ini
@@ -227,6 +263,9 @@ Startmeldung zeigt, welches PHP gefunden wurde und ob SQLite bereitsteht.
 ```
 lokaler-webserver/
 ├── server.js                          der Server
+├── waechter.js                        startet und überwacht den Server
+├── dienst/                            Einrichtung als Dienst, Taskleisten-Symbol
+├── protokoll/                         Protokoll und Zustand, legt der Wächter an
 ├── node.exe                           ~80 MB, nur mitgelegt
 ├── php/                               nur nötig für PHP
 ├── www/                               die eigenen Seiten
@@ -242,8 +281,10 @@ lokaler-webserver/
 ├── Webserver mit Fenster starten.cmd
 ├── Webserver beenden.cmd
 ├── Webserver starten.command
+├── Als Dienst einrichten.cmd
+├── Dienst entfernen.cmd
 └── LIESMICH.txt
 ```
 
-`node.exe`, `php/`, `daten/` und `zertifikat/` liegen nicht im Repository – zu groß
+`node.exe`, `php/`, `daten/`, `zertifikat/` und `protokoll/` liegen nicht im Repository – zu groß
 beziehungsweise inhaltlich nichts, was versioniert gehört.

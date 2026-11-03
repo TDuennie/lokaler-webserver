@@ -34,6 +34,37 @@ BEENDEN
 Oder das Fenster schliessen, falls sichtbar gestartet wurde.
 
 
+DAUERBETRIEB AUF EINEM SERVER
+-----------------------------
+
+  Doppelklick auf   "Als Dienst einrichten.cmd"
+
+und die Frage nach Administratorrechten mit "Ja" beantworten.
+
+Danach startet der Webserver mit Windows - auch ohne dass jemand
+angemeldet ist. Ein Waechter passt auf: Stuerzt der Server ab oder
+antwortet er nicht mehr, wird er von selbst neu gestartet.
+
+Unten rechts in der Taskleiste zeigt ein Punkt den Zustand:
+
+  gruen   laeuft
+  gelb    startet gerade
+  rot     gestoert - wird von selbst neu gestartet
+  grau    aus
+
+Rechtsklick auf den Punkt:  Im Browser oeffnen, Server neu starten,
+Protokoll anzeigen. Doppelklick oeffnet den Browser.
+
+Alles, was der Server meldet, steht mit Uhrzeit in
+"protokoll\server.log".
+
+Wieder herausnehmen:  "Dienst entfernen.cmd"
+
+Tipp: Fuer den Dauerbetrieb den Ordner nicht auf dem Desktop lassen,
+sondern zum Beispiel nach C:\Webserver legen - vorher "Dienst
+entfernen.cmd", danach dort neu einrichten.
+
+
 EIGENE SEITEN
 -------------
 
@@ -207,6 +238,9 @@ WAS IM ORDNER LIEGEN MUSS
   Webserver mit Fenster starten.cmd
   Webserver beenden.cmd
   Webserver starten.command      (fuer Mac)
+
+  waechter.js, dienst\  und die beiden Dienst-Dateien braucht nur,
+  wer den Server als Dienst laufen laesst.
 
 Die "node.exe" muss NICHT installiert werden - sie liegt einfach mit
 im Ordner. Fehlt sie, sagen die Startdateien, wo es sie gibt.
