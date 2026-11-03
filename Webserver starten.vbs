@@ -34,5 +34,7 @@ If node = "" Then
     WScript.Quit 1
 End If
 
+' Mit vollem Pfad - daran erkennt "Webserver beenden.cmd" den Server
+' dieses Ordners, falls auf dem Rechner mehrere laufen.
 ' 0 = kein Fenster, False = nicht auf das Ende warten
-shell.Run """" & node & """ ""server.js""", 0, False
+shell.Run """" & node & """ """ & fso.BuildPath(ordner, "server.js") & """", 0, False

@@ -22,7 +22,9 @@ if not defined NODE (
   exit /b 1
 )
 
-"%NODE%" server.js
+REM Mit vollem Pfad - daran erkennt "Webserver beenden.cmd" den Server
+REM dieses Ordners, falls auf dem Rechner mehrere laufen
+"%NODE%" "%~dp0server.js"
 echo.
 echo   Der Webserver wurde beendet.
 pause
