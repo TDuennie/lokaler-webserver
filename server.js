@@ -20,10 +20,14 @@ const http = require("http");
 const fs   = require("fs");
 const fsp  = require("fs/promises");
 const path = require("path");
-const url  = require("url");
 const { spawn } = require("child_process");
 
 const ORDNER = __dirname;
+
+// Laeuft der Server unter dem Waechter (waechter.js), besteht eine
+// Verbindung zu ihm: Darueber meldet er sich bereit, und endet sie,
+// beendet er sich ebenfalls.
+const UNTER_WAECHTER = typeof process.send === "function";
 
 /* ===== Einstellungen ===== */
 
@@ -81,6 +85,13 @@ const VORLAGE = [
     "port = 8080",
     "",
     "",
+    "# Name dieses Servers - fuer den Dienst und das Symbol in der",
+    "# Taskleiste. Wichtig, wenn auf einem Rechner mehrere laufen. Ohne",
+    "# Angabe gilt der Name des Ordners.",
+    "#",
+    "#   name = Planer IT",
+    "",
+    "",
     "# Welcher Ordner im Browser gezeigt wird - dort gehoeren die",
     "# eigenen Seiten hinein.",
     "",
@@ -103,6 +114,30 @@ const VORLAGE = [
     "# Ordners auflisten?   ja / nein",
     "",
     "ordnerliste = ja",
+    "",
+    "",
+    "# Verschluesselt ueber https:// statt http://?   ja / nein",
+    "# Ueblich ist dann Port 443 - so entfaellt die Portangabe.",
+    "#",
+    "# Ohne eigenes Zertifikat erstellt der Server selbst eines. Der",
+    "# Browser warnt dann, bis das Stammzertifikat aus dem Ordner",
+    "# \"zertifikat\" einmal auf dem Geraet installiert ist.",
+    "",
+    "https = nein",
+    "",
+    "",
+    "# Ein Zertifikat der eigenen IT statt des selbst erstellten:",
+    "# Pfad zu einer .pfx-Datei, oder zu einer .crt-Datei mit einer",
+    "# gleichnamigen .key-Datei daneben.",
+    "#",
+    "#   zertifikat = zertifikat/server.pfx",
+    "#   zertifikat-passwort = geheim",
+    "",
+    "",
+    "# Weitere Namen fuer das selbst erstellte Zertifikat, durch Komma",
+    "# getrennt. Rechnername und IP-Adressen stehen schon von selbst drin.",
+    "#",
+    "#   namen = planer.firma.local",
     ""
 ].join("\r\n");
 
@@ -197,7 +232,25 @@ const EINSTELLUNGEN = {
 
     keinListing: schalter("kein-listing") ||
                  dateiVorhanden("kein-listing.txt") ||
-                 !jaNein(DATEI_WERTE.ordnerliste, true)
+                 !jaNein(DATEI_WERTE.ordnerliste, true),
+
+    https: schalter("https") ||
+           process.env.HTTPS === "1" ||
+           jaNein(DATEI_WERTE.https, false),
+
+    zertifikat: argument("zertifikat") ||
+                process.env.ZERTIFIKAT ||
+                DATEI_WERTE.zertifikat ||
+                "",
+
+    zertifikatPasswort: process.env.ZERTIFIKAT_PASSWORT ||
+                        DATEI_WERTE["zertifikat-passwort"] ||
+                        "",
+
+    // Weitere Namen, unter denen der Server erreichbar ist, etwa
+    // "planer.firma.local" - kommen mit ins selbst erstellte Zertifikat
+    namen: (argument("namen") || DATEI_WERTE.namen || "")
+               .split(/[,;\s]+/).filter(Boolean)
 };
 
 if (!Number.isInteger(EINSTELLUNGEN.port) ||
@@ -212,6 +265,423 @@ if (!Number.isInteger(EINSTELLUNGEN.port) ||
 const WURZEL = path.resolve(ORDNER, EINSTELLUNGEN.ordner);
 
 const ADRESSE = EINSTELLUNGEN.imNetzwerk ? "0.0.0.0" : "127.0.0.1";
+
+const SCHEMA = EINSTELLUNGEN.https ? "https" : "http";
+
+/* ===== HTTPS-Zertifikat ===== */
+
+// Fuer https braucht der Server ein Zertifikat. Bringt die IT eines mit,
+// wird das genommen. Sonst erstellt der Server selbst eine kleine eigene
+// Zertifizierungsstelle (Stammzertifikat) und damit ein Zertifikat fuer
+// sich. Das Stammzertifikat wird einmal auf den Geraeten installiert -
+// danach vertrauen sie jedem Zertifikat, das der Server sich ausstellt,
+// auch wenn er es spaeter wegen einer neuen IP-Adresse erneuert.
+//
+// Erzeugt wird alles mit Node.js selbst, ohne OpenSSL.
+
+const crypto = require("crypto");
+const os     = require("os");
+
+const ZERTIFIKAT_ORDNER = path.join(ORDNER, "zertifikat");
+
+const STAMM_ZERTIFIKAT = path.join(ZERTIFIKAT_ORDNER, "stammzertifikat.crt");
+const STAMM_SCHLUESSEL = path.join(ZERTIFIKAT_ORDNER, "stammzertifikat.key");
+// Das Server-Zertifikat je Rechner, falls mehrere Arbeitsplaetze den
+// Server aus demselben Sync-Ordner starten - das Stammzertifikat teilen sie
+const RECHNER = os.hostname().toLowerCase().replace(/[^a-z0-9.-]/g, "_");
+const SERVER_ZERTIFIKAT = path.join(ZERTIFIKAT_ORDNER, "server-" + RECHNER + ".crt");
+const SERVER_SCHLUESSEL = path.join(ZERTIFIKAT_ORDNER, "server-" + RECHNER + ".key");
+
+// Unter dieser Adresse laesst sich das Stammzertifikat herunterladen,
+// etwa am iPad, um es dort zu installieren
+const ZERTIFIKAT_PFAD = "/_zertifikat";
+
+// Kleine Bausteine fuer das Binaerformat von Zertifikaten (DER/ASN.1)
+
+function asn1(kennung, inhalt) {
+
+    const laenge = inhalt.length;
+    let kopf;
+
+    if (laenge < 0x80) {
+        kopf = Buffer.from([kennung, laenge]);
+    } else {
+
+        const bytes = [];
+
+        for (let rest = laenge; rest > 0; rest = Math.floor(rest / 256)) {
+            bytes.unshift(rest & 0xff);
+        }
+
+        kopf = Buffer.from([kennung, 0x80 | bytes.length].concat(bytes));
+    }
+
+    return Buffer.concat([kopf, inhalt]);
+}
+
+function folge(...teile) {
+    return asn1(0x30, Buffer.concat(teile));
+}
+
+function menge(...teile) {
+    return asn1(0x31, Buffer.concat(teile));
+}
+
+function ganzzahl(bytes) {
+
+    // Ein gesetztes oberstes Bit hiesse "negativ"
+    return asn1(0x02, bytes[0] & 0x80 ? Buffer.concat([Buffer.from([0]), bytes]) : bytes);
+}
+
+function kennzeichen(text) {
+
+    const zahlen = text.split(".").map(Number);
+    const bytes = [zahlen[0] * 40 + zahlen[1]];
+
+    for (const zahl of zahlen.slice(2)) {
+
+        const gruppe = [zahl & 0x7f];
+
+        for (let rest = Math.floor(zahl / 128); rest > 0; rest = Math.floor(rest / 128)) {
+            gruppe.unshift((rest & 0x7f) | 0x80);
+        }
+
+        bytes.push(...gruppe);
+    }
+
+    return asn1(0x06, Buffer.from(bytes));
+}
+
+function zeitpunkt(datum) {
+
+    const text = datum.toISOString().replace(/[-:T]/g, "").slice(0, 14) + "Z";
+
+    // Bis 2049 als UTCTime mit zweistelligem Jahr, danach GeneralizedTime
+    return datum.getUTCFullYear() < 2050
+        ? asn1(0x17, Buffer.from(text.slice(2)))
+        : asn1(0x18, Buffer.from(text));
+}
+
+function namensfeld(gemeinsamerName) {
+
+    return folge(
+        menge(folge(kennzeichen("2.5.4.10"), asn1(0x0c, Buffer.from("Lokaler Webserver")))),
+        menge(folge(kennzeichen("2.5.4.3"), asn1(0x0c, Buffer.from(gemeinsamerName))))
+    );
+}
+
+function erweiterung(oid, kritisch, inhalt) {
+
+    return folge(
+        kennzeichen(oid),
+        kritisch ? asn1(0x01, Buffer.from([0xff])) : Buffer.alloc(0),
+        asn1(0x04, inhalt)
+    );
+}
+
+function ipBytes(adresse) {
+
+    if (adresse.indexOf(":") < 0) {
+        return Buffer.from(adresse.split(".").map(Number));
+    }
+
+    // IPv6, auch in Kurzschreibweise wie ::1
+    const [vorne, hinten] = adresse.split("::");
+    const links  = vorne ? vorne.split(":") : [];
+    const rechts = hinten !== undefined && hinten ? hinten.split(":") : [];
+    const gruppen = hinten === undefined
+        ? links
+        : links.concat(new Array(8 - links.length - rechts.length).fill("0"), rechts);
+
+    return Buffer.concat(gruppen.map(function (gruppe) {
+        const zahl = parseInt(gruppe, 16);
+        return Buffer.from([zahl >> 8, zahl & 0xff]);
+    }));
+}
+
+function zertifikatAusstellen(angaben) {
+
+    const sha256mitRsa = folge(kennzeichen("1.2.840.113549.1.1.11"), asn1(0x05, Buffer.alloc(0)));
+
+    const seriennummer = crypto.randomBytes(16);
+    seriennummer[0] &= 0x7f;
+
+    const oeffentlich = angaben.oeffentlich.export({ type: "spki", format: "der" });
+    const eigeneKennung = crypto.createHash("sha1").update(oeffentlich).digest();
+
+    const erweiterungen = [
+        erweiterung("2.5.29.19", true, angaben.stelle
+            ? folge(asn1(0x01, Buffer.from([0xff])), ganzzahl(Buffer.from([0])))
+            : folge()),
+        erweiterung("2.5.29.15", true, angaben.stelle
+            // keyCertSign, cRLSign
+            ? asn1(0x03, Buffer.from([0x01, 0x06]))
+            // digitalSignature, keyEncipherment
+            : asn1(0x03, Buffer.from([0x05, 0xa0]))),
+        erweiterung("2.5.29.14", false, asn1(0x04, eigeneKennung))
+    ];
+
+    if (!angaben.stelle) {
+
+        // Nur fuer Webserver, mit Verweis auf das Stammzertifikat
+        erweiterungen.push(
+            erweiterung("2.5.29.37", false, folge(kennzeichen("1.3.6.1.5.5.7.3.1"))),
+            erweiterung("2.5.29.35", false, folge(asn1(0x80, angaben.ausstellerKennung))),
+            erweiterung("2.5.29.17", false, folge(
+                ...angaben.namen.map(function (eintrag) {
+                    return /^[\d.]+$|:/.test(eintrag)
+                        ? asn1(0x87, ipBytes(eintrag))
+                        : asn1(0x82, Buffer.from(eintrag));
+                })
+            ))
+        );
+    }
+
+    const jetzt = Date.now();
+
+    const inhalt = folge(
+        asn1(0xa0, ganzzahl(Buffer.from([2]))),
+        ganzzahl(seriennummer),
+        sha256mitRsa,
+        namensfeld(angaben.aussteller),
+        folge(
+            // Einen Tag zurueck, falls die Uhr eines Geraets nachgeht
+            zeitpunkt(new Date(jetzt - 24 * 3600 * 1000)),
+            zeitpunkt(new Date(jetzt + angaben.tage * 24 * 3600 * 1000))
+        ),
+        namensfeld(angaben.inhaber),
+        oeffentlich,
+        asn1(0xa3, folge(...erweiterungen))
+    );
+
+    const unterschrift = crypto.sign("sha256", inhalt, angaben.unterschreiber);
+
+    const der = folge(inhalt, sha256mitRsa, asn1(0x03, Buffer.concat([Buffer.from([0]), unterschrift])));
+
+    return "-----BEGIN CERTIFICATE-----\n" +
+           der.toString("base64").match(/.{1,64}/g).join("\n") +
+           "\n-----END CERTIFICATE-----\n";
+}
+
+function schluesselSchreiben(datei, schluessel) {
+
+    fs.writeFileSync(datei, schluessel.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+}
+
+// Alle Namen und Adressen, unter denen der Server erreichbar sein kann
+function eigeneNamen() {
+
+    const namen = ["localhost", "127.0.0.1", "::1"];
+    const rechner = os.hostname().toLowerCase();
+
+    namen.push(rechner);
+
+    // In einer Windows-Domaene auch der volle Name, z. B. server.firma.local
+    if (process.env.USERDNSDOMAIN && rechner.indexOf(".") < 0) {
+        namen.push(rechner + "." + process.env.USERDNSDOMAIN.toLowerCase());
+    }
+
+    for (const liste of Object.values(os.networkInterfaces())) {
+        for (const eintrag of liste || []) {
+            if (eintrag.family === "IPv4" && !eintrag.internal) {
+                namen.push(eintrag.address);
+            }
+        }
+    }
+
+    for (const zusatz of EINSTELLUNGEN.namen) {
+        namen.push(zusatz.toLowerCase());
+    }
+
+    return Array.from(new Set(namen));
+}
+
+function enthaeltName(zertifikat, eintrag) {
+
+    const liste = (zertifikat.subjectAltName || "").split(", ");
+
+    if (/^[\d.]+$|:/.test(eintrag)) {
+
+        const gesucht = ipBytes(eintrag).toString("hex");
+
+        return liste.some(function (vorhanden) {
+            return vorhanden.startsWith("IP Address:") &&
+                   ipBytes(vorhanden.slice(11)).toString("hex") === gesucht;
+        });
+    }
+
+    return liste.indexOf("DNS:" + eintrag) >= 0;
+}
+
+function selbstErstelltesZertifikat() {
+
+    fs.mkdirSync(ZERTIFIKAT_ORDNER, { recursive: true });
+
+    const meldungen = [];
+
+    // Das Stammzertifikat bleibt, solange es gueltig ist - sonst muesste
+    // es auf allen Geraeten neu installiert werden
+    let stamm = null;
+
+    try {
+
+        stamm = {
+            zertifikat: new crypto.X509Certificate(fs.readFileSync(STAMM_ZERTIFIKAT)),
+            schluessel: crypto.createPrivateKey(fs.readFileSync(STAMM_SCHLUESSEL))
+        };
+
+        if (new Date(stamm.zertifikat.validTo) < new Date()) {
+            stamm = null;
+        }
+
+    } catch (fehler) {
+        stamm = null;
+    }
+
+    if (!stamm) {
+
+        const paar = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+        const inhaber = "Lokaler Webserver Stamm " + os.hostname();
+
+        const pem = zertifikatAusstellen({
+            stelle: true,
+            aussteller: inhaber,
+            inhaber: inhaber,
+            oeffentlich: paar.publicKey,
+            unterschreiber: paar.privateKey,
+            tage: 3650
+        });
+
+        schluesselSchreiben(STAMM_SCHLUESSEL, paar.privateKey);
+        fs.writeFileSync(STAMM_ZERTIFIKAT, pem);
+
+        stamm = { zertifikat: new crypto.X509Certificate(pem), schluessel: paar.privateKey };
+
+        meldungen.push("Neues Stammzertifikat erstellt - bitte auf den Geraeten installieren.");
+    }
+
+    // Das Server-Zertifikat wird erneuert, wenn es bald ablaeuft oder
+    // ein Name oder eine IP-Adresse fehlt
+    const namen = eigeneNamen();
+    let neuNoetig = true;
+
+    try {
+
+        const vorhanden = new crypto.X509Certificate(fs.readFileSync(SERVER_ZERTIFIKAT));
+        crypto.createPrivateKey(fs.readFileSync(SERVER_SCHLUESSEL));
+
+        const restTage = (new Date(vorhanden.validTo) - Date.now()) / (24 * 3600 * 1000);
+
+        neuNoetig = restTage < 60 ||
+                    !vorhanden.checkIssued(stamm.zertifikat) ||
+                    !vorhanden.verify(stamm.zertifikat.publicKey) ||
+                    !namen.every(function (eintrag) { return enthaeltName(vorhanden, eintrag); });
+
+    } catch (fehler) {
+        neuNoetig = true;
+    }
+
+    if (neuNoetig) {
+
+        const paar = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+        const stammKennung = crypto.createHash("sha1")
+            .update(stamm.zertifikat.publicKey.export({ type: "spki", format: "der" }))
+            .digest();
+
+        const pem = zertifikatAusstellen({
+            stelle: false,
+            aussteller: stamm.zertifikat.subject.split("\n")
+                            .find(function (z) { return z.startsWith("CN="); }).slice(3),
+            ausstellerKennung: stammKennung,
+            inhaber: os.hostname(),
+            namen: namen,
+            oeffentlich: paar.publicKey,
+            unterschreiber: stamm.schluessel,
+            // Apple-Geraete nehmen hoechstens 825 Tage an
+            tage: 800
+        });
+
+        schluesselSchreiben(SERVER_SCHLUESSEL, paar.privateKey);
+        fs.writeFileSync(SERVER_ZERTIFIKAT, pem);
+
+        meldungen.push("Server-Zertifikat erstellt fuer: " + namen.join(", "));
+    }
+
+    return {
+        optionen: {
+            key: fs.readFileSync(SERVER_SCHLUESSEL),
+            cert: fs.readFileSync(SERVER_ZERTIFIKAT)
+        },
+        selbstErstellt: true,
+        meldungen: meldungen
+    };
+}
+
+function eigenesZertifikat() {
+
+    const datei = path.resolve(ORDNER, EINSTELLUNGEN.zertifikat);
+    const endung = path.extname(datei).toLowerCase();
+
+    if (endung === ".pfx" || endung === ".p12") {
+
+        return {
+            optionen: {
+                pfx: fs.readFileSync(datei),
+                passphrase: EINSTELLUNGEN.zertifikatPasswort
+            },
+            selbstErstellt: false,
+            meldungen: []
+        };
+    }
+
+    const schluessel = datei.slice(0, datei.length - endung.length) + ".key";
+
+    if (!fs.existsSync(schluessel)) {
+        throw new Error("Zum Zertifikat fehlt der Schluessel \"" + schluessel + "\".");
+    }
+
+    return {
+        optionen: {
+            key: fs.readFileSync(schluessel),
+            cert: fs.readFileSync(datei),
+            passphrase: EINSTELLUNGEN.zertifikatPasswort || undefined
+        },
+        selbstErstellt: false,
+        meldungen: []
+    };
+}
+
+let TLS = null;
+
+if (EINSTELLUNGEN.https) {
+
+    try {
+
+        TLS = EINSTELLUNGEN.zertifikat ? eigenesZertifikat() : selbstErstelltesZertifikat();
+
+        // Gleich hier pruefen, damit ein falsches Passwort oder eine
+        // kaputte Datei eine klare Meldung gibt statt eines Absturzes
+        require("tls").createSecureContext(TLS.optionen);
+
+    } catch (fehler) {
+
+        console.error("");
+        console.error("  HTTPS laesst sich nicht einschalten:");
+        console.error("  " + (/mac verify|bad decrypt/i.test(fehler.message)
+                                  ? "Das Passwort passt nicht zum Zertifikat."
+                                  : fehler.message));
+        console.error("");
+
+        if (EINSTELLUNGEN.zertifikat) {
+            console.error("  Bitte \"zertifikat\" und \"zertifikat-passwort\" in");
+            console.error("  \"einstellungen.txt\" pruefen.");
+        } else {
+            console.error("  Der Ordner \"zertifikat\" muss beschreibbar sein.");
+        }
+
+        process.exit(1);
+    }
+}
 
 /* ===== PHP finden ===== */
 
@@ -279,8 +749,26 @@ const PHP_INI_INHALT = [
     "extension=zip",
     "extension=exif",
     "",
-    "display_errors = On",
+    "; Fehlermeldungen nicht im Browser zeigen - sie verraten Pfade und",
+    "; Code. Sie landen stattdessen im Protokoll des Servers. Zum",
+    "; Entwickeln auf dem eigenen Rechner darf hier On stehen.",
+    "display_errors = Off",
+    "log_errors = On",
     "error_reporting = E_ALL",
+    "",
+    "; Die PHP-Version nicht in jeder Antwort verraten",
+    "expose_php = Off",
+    "",
+    "; Sitzungen: Cookie nicht fuer JavaScript lesbar, nicht an fremde",
+    "; Seiten mitgeschickt, und nur vom Server vergebene Kennungen",
+    "session.cookie_httponly = 1",
+    "session.cookie_samesite = Lax",
+    "session.use_strict_mode = 1",
+    "session.use_only_cookies = 1",
+    "",
+    "; Wird nicht gebraucht und war schon Einfallstor fuer Angriffe",
+    "session.upload_progress.enabled = 0",
+    "allow_url_include = Off",
     "",
     "upload_max_filesize = 64M",
     "post_max_size = 64M",
@@ -438,17 +926,40 @@ function groesseAnzeigen(bytes) {
 
 // Dateien, die zwar im Ordner liegen duerfen, aber nicht ueber den
 // Browser abrufbar sein sollen - allen voran die SQLite-Datenbank.
-const GESCHUETZT = [".sqlite", ".sqlite3", ".db", ".db3", ".env", ".ini", ".htaccess"];
+const GESCHUETZT = [".sqlite", ".sqlite3", ".db", ".db3", ".env", ".ini", ".htaccess",
+                    ".key", ".pem", ".pfx", ".p12",
+                    // Sicherungskopien wuerden PHP-Quelltext als Text ausliefern
+                    ".bak", ".old", ".orig", ".save", ".swp", ".log"];
 
 function istGeschuetzt(datei) {
 
     const name = path.basename(datei).toLowerCase();
 
-    if (name === ".env" || name === ".htaccess") {
+    // Versteckte Dateien wie .env, .htpasswd, .gitignore - und "datei.php~"
+    if (name.startsWith(".") || name.endsWith("~")) {
         return true;
     }
 
     return GESCHUETZT.indexOf(path.extname(name)) >= 0;
+}
+
+// Pfade, die nie ausgeliefert werden - egal, was darin liegt:
+//
+//  - Ordner, deren Name mit einem Punkt beginnt (.git, .vscode, ...)
+//  - Doppelpunkte: unter Windows oeffnet "seite.php::$DATA" dieselbe Datei
+//    wie "seite.php", nur endet der Name dann nicht mehr auf ".php" - der
+//    Quelltext kaeme als Text heraus
+//  - Namen mit Punkt oder Leerzeichen am Ende: Windows schneidet beides
+//    stillschweigend ab, "seite.php." waere also ebenfalls der Quelltext
+function istUnzulaessigerPfad(urlPfad) {
+
+    if (urlPfad.indexOf(":") >= 0 || urlPfad.indexOf("\0") >= 0) {
+        return true;
+    }
+
+    return urlPfad.split("/").some(function (teil) {
+        return teil.startsWith(".") || / $|\.$/.test(teil);
+    });
 }
 
 // Dateien, die Sync-Dienste und Betriebssysteme anlegen
@@ -475,6 +986,7 @@ async function verzeichnisAnzeigen(antwort, ordner, urlPfad) {
         (await fsp.readdir(ordner, { withFileTypes: true }))
             .filter(function (eintrag) {
                 return !istMuell(eintrag.name) &&
+                       !eintrag.name.startsWith(".") &&
                        (eintrag.isDirectory() || !istGeschuetzt(eintrag.name));
             })
             .sort(function (a, b) {
@@ -534,7 +1046,7 @@ async function verzeichnisAnzeigen(antwort, ordner, urlPfad) {
         "</style>" +
         "<h1>" + entschaerfen(decodeURIComponent(urlPfad)) + "</h1>" +
         "<ul>" + (zeilen.join("") || "<li class=\"d\"><span>Der Ordner ist leer.</span></li>") + "</ul>" +
-        "<footer>Lokaler Webserver &middot; " + entschaerfen(WURZEL) + "</footer>";
+        "<footer>Lokaler Webserver</footer>";
 
     antwort.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
@@ -545,6 +1057,13 @@ async function verzeichnisAnzeigen(antwort, ordner, urlPfad) {
 }
 
 /* ===== PHP ausfuehren ===== */
+
+function istLokal(anfrage) {
+
+    const adresse = anfrage.socket.remoteAddress || "";
+
+    return adresse === "127.0.0.1" || adresse === "::1" || adresse === "::ffff:127.0.0.1";
+}
 
 function phpAusfuehren(anfrage, antwort, datei, urlPfad, abfrage) {
 
@@ -558,7 +1077,8 @@ function phpAusfuehren(anfrage, antwort, datei, urlPfad, abfrage) {
         SERVER_SOFTWARE: "LokalerWebserver",
         SERVER_PROTOCOL: "HTTP/1.1",
         SERVER_NAME: "localhost",
-        SERVER_PORT: String(EINSTELLUNGEN.port),
+        SERVER_PORT: String(anfrage.socket.localPort || EINSTELLUNGEN.port),
+        REQUEST_SCHEME: SCHEMA,
         DOCUMENT_ROOT: WURZEL,
         SCRIPT_FILENAME: datei,
         SCRIPT_NAME: urlPfad,
@@ -575,8 +1095,20 @@ function phpAusfuehren(anfrage, antwort, datei, urlPfad, abfrage) {
         REDIRECT_STATUS: "200"
     });
 
-    // Alle uebrigen Kopfzeilen der Anfrage weiterreichen
+    // Daran erkennt PHP eine verschluesselte Verbindung ($_SERVER["HTTPS"])
+    if (EINSTELLUNGEN.https) {
+        umgebung.HTTPS = "on";
+    }
+
+    // Alle uebrigen Kopfzeilen der Anfrage weiterreichen - ausser "Proxy":
+    // Daraus wuerde HTTP_PROXY, und viele PHP-Bibliotheken nehmen das als
+    // Proxy fuer ihre eigenen Verbindungen ("httpoxy"). Ein Angreifer
+    // koennte so ausgehende Anfragen samt Zugangsdaten umleiten.
     for (const [name, wert] of Object.entries(anfrage.headers)) {
+
+        if (name.toLowerCase() === "proxy") {
+            continue;
+        }
 
         const schluessel =
             "HTTP_" + name.toUpperCase().replace(/-/g, "_");
@@ -636,8 +1168,14 @@ function phpAusfuehren(anfrage, antwort, datei, urlPfad, abfrage) {
         if (trenner < 0) {
 
             if (ausgabe.length === 0 && fehlertext) {
+
+                // Die Meldung verraet Pfade und Code - im Browser nur auf
+                // dem Rechner selbst, sonst steht sie im Protokoll
                 fehlerSeite(antwort, 500, "Fehler in PHP",
-                            "<code>" + entschaerfen(fehlertext) + "</code>");
+                            istLokal(anfrage)
+                                ? "<code>" + entschaerfen(fehlertext) + "</code>"
+                                : "Die Seite konnte nicht erzeugt werden. Die Einzelheiten " +
+                                  "stehen im Protokoll des Servers.");
                 return;
             }
 
@@ -689,7 +1227,18 @@ function phpAusfuehren(anfrage, antwort, datei, urlPfad, abfrage) {
 
         kopfzeilen["Cache-Control"] = "no-store";
 
-        antwort.writeHead(status, kopfzeilen);
+        // Schickt PHP eine Kopfzeile mit unzulaessigen Zeichen (etwa einen
+        // Umlaut in Content-Disposition), wirft Node hier - ohne dieses
+        // try wuerde das den ganzen Server beenden
+        try {
+            antwort.writeHead(status, kopfzeilen);
+        } catch (fehler) {
+            console.error("  PHP hat eine ungueltige Kopfzeile geschickt: " + fehler.message);
+            fehlerSeite(antwort, 500, "Fehler in PHP",
+                        "Die Seite hat eine ungueltige Kopfzeile geschickt.");
+            return;
+        }
+
         antwort.end(inhalt);
     });
 }
@@ -782,14 +1331,21 @@ async function beantworten(anfrage, antwort) {
         return;
     }
 
-    const zerlegt = url.parse(anfrage.url);
-
+    let zerlegt;
     let urlPfad;
 
     try {
+        // Vorangestellt statt als Basis, damit "//pfad" ein Pfad bleibt
+        zerlegt = new URL("http://localhost" + anfrage.url);
         urlPfad = decodeURIComponent(zerlegt.pathname);
     } catch (fehler) {
         fehlerSeite(antwort, 400, "Fehlerhafte Adresse", "Die Adresse ist nicht lesbar.");
+        return;
+    }
+
+    if (istUnzulaessigerPfad(urlPfad)) {
+        fehlerSeite(antwort, 404, "Nicht gefunden",
+                    "<code>" + entschaerfen(urlPfad) + "</code> gibt es hier nicht.");
         return;
     }
 
@@ -826,7 +1382,11 @@ async function beantworten(anfrage, antwort) {
 
         // Ohne Schrägstrich am Ende zeigen relative Verweise ins Leere
         if (!urlPfad.endsWith("/")) {
-            antwort.writeHead(301, { "Location": urlPfad + "/" + (zerlegt.search || "") });
+            // Fuehrende Schraegstriche zusammenfassen: "//ziel/" waere fuer den
+            // Browser eine Adresse auf einem anderen Rechner
+            antwort.writeHead(301, {
+                "Location": encodeURI(urlPfad.replace(/^\/+/, "/") + "/") + zerlegt.search
+            });
             antwort.end();
             return;
         }
@@ -845,7 +1405,7 @@ async function beantworten(anfrage, antwort) {
                     }
 
                     phpAusfuehren(anfrage, antwort, startseite,
-                                  urlPfad + name, (zerlegt.query || ""));
+                                  urlPfad + name, zerlegt.search.slice(1));
                     return;
                 }
 
@@ -858,14 +1418,31 @@ async function beantworten(anfrage, antwort) {
         return;
     }
 
-    if (path.extname(ziel).toLowerCase() === ".php") {
+    // Ueber den echten Namen der Datei entscheiden, nicht ueber den
+    // angefragten: Windows oeffnet "SEITE~1.PHP" oder "DATENB~1.SQL" als
+    // Kurznamen von "seite.php" bzw. "datenbank.sqlite"
+    let echt = ziel;
+
+    try {
+        echt = await fsp.realpath(ziel);
+    } catch (fehler) {
+        // Dann eben der angefragte
+    }
+
+    if (istGeschuetzt(echt)) {
+        fehlerSeite(antwort, 403, "Kein Zugriff",
+                    "Diese Datei wird nicht ausgeliefert.");
+        return;
+    }
+
+    if (path.extname(echt).toLowerCase() === ".php" || path.extname(ziel).toLowerCase() === ".php") {
 
         if (!PHP) {
             phpFehlt(antwort);
             return;
         }
 
-        phpAusfuehren(anfrage, antwort, ziel, urlPfad, (zerlegt.query || ""));
+        phpAusfuehren(anfrage, antwort, ziel, urlPfad, zerlegt.search.slice(1));
         return;
     }
 
@@ -883,9 +1460,31 @@ function phpFehlt(antwort) {
 
 /* ===== Server ===== */
 
-const server = http.createServer(function (anfrage, antwort) {
+const STATUS_PFAD = "/_status";
+const GESTARTET = new Date().toISOString();
+
+function anfrageBearbeiten(anfrage, antwort) {
 
     const beginn = Date.now();
+
+    // Fuer jede Antwort, auch die von PHP: Der Browser soll den Dateityp
+    // nicht raten (sonst wird aus einer hochgeladenen .txt womoeglich
+    // ausfuehrbares HTML), und Adressen samt Parametern sollen nicht an
+    // fremde Seiten weitergegeben werden.
+    antwort.setHeader("X-Content-Type-Options", "nosniff");
+    antwort.setHeader("Referrer-Policy", "same-origin");
+
+    // Lebenszeichen fuer den Waechter und den Proxy der IT
+    if (anfrage.url === STATUS_PFAD) {
+
+        antwort.writeHead(200, {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store"
+        });
+
+        antwort.end(JSON.stringify({ status: "ok", seit: GESTARTET }));
+        return;
+    }
 
     antwort.on("finish", function () {
 
@@ -895,6 +1494,20 @@ const server = http.createServer(function (anfrage, antwort) {
                     anfrage.method + " " + anfrage.url +
                     "  (" + (Date.now() - beginn) + " ms)");
     });
+
+    // Das selbst erstellte Stammzertifikat zum Installieren auf anderen
+    // Geraeten - nur das Zertifikat, nie ein Schluessel
+    if (TLS && TLS.selbstErstellt && anfrage.url.split("?")[0] === ZERTIFIKAT_PFAD) {
+
+        antwort.writeHead(200, {
+            "Content-Type": "application/x-x509-ca-cert",
+            "Content-Disposition": "attachment; filename=\"Webserver-Stammzertifikat.crt\"",
+            "Cache-Control": "no-store"
+        });
+
+        antwort.end(fs.readFileSync(STAMM_ZERTIFIKAT));
+        return;
+    }
 
     beantworten(anfrage, antwort).catch(function (fehler) {
 
@@ -906,7 +1519,90 @@ const server = http.createServer(function (anfrage, antwort) {
             antwort.destroy();
         }
     });
-});
+}
+
+const server = TLS
+    ? require("https").createServer(TLS.optionen, anfrageBearbeiten)
+    : http.createServer(anfrageBearbeiten);
+
+// Ruft jemand die https-Adresse mit http:// auf, kommt sonst nur eine
+// leere Seite. Stattdessen wird er auf https:// umgeleitet.
+if (TLS) {
+
+    const tlsVerbindung = server.listeners("connection").slice();
+
+    server.removeAllListeners("connection");
+
+    server.on("connection", function (verbindung) {
+
+        // Bricht die Verbindung schon hier ab, darf das den Server nicht
+        // mitreissen
+        verbindung.on("error", function () {});
+
+        // Wer verbindet und nichts schickt, wird nach einer Weile getrennt
+        const wartezeit = setTimeout(function () { verbindung.destroy(); }, 30000);
+
+        verbindung.once("close", function () { clearTimeout(wartezeit); });
+
+        verbindung.once("readable", function () {
+
+            clearTimeout(wartezeit);
+
+
+            const erstes = verbindung.read(1);
+
+            if (erstes === null) {
+                return;
+            }
+
+            verbindung.unshift(erstes);
+
+            // Eine verschluesselte Verbindung beginnt immer mit 0x16
+            if (erstes[0] === 0x16) {
+
+                for (const weiter of tlsVerbindung) {
+                    weiter.call(server, verbindung);
+                }
+
+                return;
+            }
+
+            umleitenAufHttps(verbindung);
+        });
+    });
+}
+
+function umleitenAufHttps(verbindung) {
+
+    const teile = [];
+
+    verbindung.on("data", function (teil) {
+
+        teile.push(teil);
+
+        const kopf = Buffer.concat(teile).toString("latin1");
+
+        if (kopf.indexOf("\r\n\r\n") < 0 && kopf.length < 8192) {
+            return;
+        }
+
+        const zeile = kopf.split("\r\n")[0].split(" ");
+        const pfad = zeile[1] && zeile[1].startsWith("/") ? zeile[1] : "/";
+        const host = (/^host:\s*([^\r\n]+)/im.exec(kopf) || [])[1] ||
+                     "localhost:" + verbindung.localPort;
+
+        verbindung.end(
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://" + host.trim() + pfad + "\r\n" +
+            "Content-Length: 0\r\n" +
+            "Connection: close\r\n\r\n"
+        );
+    });
+
+    verbindung.on("error", function () {
+        // Verbindung abgebrochen - nichts zu tun
+    });
+}
 
 /* ===== Browser oeffnen ===== */
 
@@ -967,7 +1663,9 @@ function starten(port, versuche) {
             return;
         }
 
-        if (fehler.code === "EADDRINUSE") {
+        if (fehler.code === "EADDRINUSE" && UNTER_WAECHTER) {
+            console.error("  Port " + port + " ist belegt - laeuft der Webserver noch ein zweites Mal?");
+        } else if (fehler.code === "EADDRINUSE") {
             console.error("");
             console.error("  Es ist kein freier Port zu finden.");
             console.error("  In \"einstellungen.txt\" eine andere Zahl bei \"port\" eintragen.");
@@ -985,8 +1683,8 @@ function starten(port, versuche) {
                 console.error("       eintragen, zum Beispiel 8080.");
                 console.error("    2. Den Server mit erweiterten Rechten starten:");
                 console.error("       sudo node server.js");
-            } else if (port === 80) {
-                console.error("  Port 80 ist auf diesem Rechner belegt - haeufig durch");
+            } else if (port === 80 || port === 443) {
+                console.error("  Port " + port + " ist auf diesem Rechner belegt - haeufig durch");
                 console.error("  IIS, einen anderen Webserver oder Skype.");
                 console.error("  In \"einstellungen.txt\" zum Beispiel 8080 eintragen.");
             } else {
@@ -998,6 +1696,12 @@ function starten(port, versuche) {
         }
 
         process.exitCode = 1;
+
+        // Unter dem Waechter haelt die Verbindung zu ihm den Prozess am
+        // Leben - also ausdruecklich beenden, er versucht es dann erneut
+        if (UNTER_WAECHTER) {
+            process.exit(1);
+        }
     });
 }
 
@@ -1005,9 +1709,18 @@ server.on("listening", function () {
 
     const port = server.address().port;
 
-    // Bei Port 80 gehoert keine Portangabe in die Adresse
-    const adresse =
-        port === 80 ? "http://localhost/" : "http://localhost:" + port + "/";
+    if (UNTER_WAECHTER) {
+        process.send({ bereit: true, port: port, schema: SCHEMA });
+    }
+
+    // Beim ueblichen Port gehoert keine Portangabe in die Adresse
+    const ohnePort = port === (TLS ? 443 : 80);
+
+    function adresseFuer(rechner) {
+        return SCHEMA + "://" + rechner + (ohnePort ? "" : ":" + port) + "/";
+    }
+
+    const adresse = adresseFuer("localhost");
 
     console.log("");
     console.log("  ======================================================");
@@ -1021,7 +1734,23 @@ server.on("listening", function () {
         const ip = netzwerkAdresse();
 
         if (ip) {
-            console.log("   Im Netz   http://" + ip + ":" + port + "/");
+            console.log("   Im Netz   " + adresseFuer(ip));
+        }
+    }
+
+    if (TLS) {
+
+        if (TLS.selbstErstellt) {
+            console.log("   HTTPS     mit selbst erstelltem Zertifikat");
+            console.log("             Stammzertifikat fuer andere Geraete:");
+            console.log("             " + adresseFuer(EINSTELLUNGEN.imNetzwerk && netzwerkAdresse() || "localhost")
+                                            .replace(/\/$/, "") + ZERTIFIKAT_PFAD);
+        } else {
+            console.log("   HTTPS     " + path.resolve(ORDNER, EINSTELLUNGEN.zertifikat));
+        }
+
+        for (const meldung of TLS.meldungen) {
+            console.log("             " + meldung);
         }
     }
 
@@ -1089,4 +1818,36 @@ process.on("SIGINT", function () {
     process.exit(0);
 });
 
-starten(EINSTELLUNGEN.port, 20);
+if (UNTER_WAECHTER) {
+    process.on("disconnect", function () { process.exit(0); });
+}
+
+// Laeuft der Server schon als Dienst unter dem Waechter, keinen zweiten
+// daneben starten - nur den Browser auf den laufenden oeffnen
+if (!UNTER_WAECHTER) {
+
+    try {
+
+        const dienst = JSON.parse(
+            fs.readFileSync(path.join(ORDNER, "protokoll", "status.json"), "utf8"));
+
+        if (dienst.zustand === "laeuft" && Date.now() - dienst.aktualisiertMs < 30 * 1000) {
+
+            const adresse = dienst.schema + "://localhost:" + dienst.port + "/";
+
+            console.log("");
+            console.log("  Der Webserver laeuft bereits als Dienst:  " + adresse);
+            console.log("");
+
+            browserOeffnen(adresse);
+            process.exit(0);
+        }
+
+    } catch (fehler) {
+        // Kein Dienst eingerichtet - ganz normal starten
+    }
+}
+
+// Unter dem Waechter bleibt es beim eingestellten Port - der Proxy der IT
+// erwartet ihn dort. Ist er belegt, versucht es der Waechter spaeter erneut.
+starten(EINSTELLUNGEN.port, UNTER_WAECHTER ? 0 : 20);

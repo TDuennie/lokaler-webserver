@@ -22,6 +22,8 @@ weitergegeben als einzelne Datei.
 | `Webserver mit Fenster starten.cmd` | Windows, mit allen Meldungen |
 | `Webserver beenden.cmd` | beendet den laufenden Server |
 | `Webserver starten.command` | macOS und Linux |
+| `Als Dienst einrichten.cmd` | Windows: startet mit Windows, überwacht, Symbol in der Taskleiste |
+| `Dienst entfernen.cmd` | nimmt das wieder heraus |
 
 Oder direkt:
 
@@ -47,6 +49,8 @@ ersatzweise auf ein installiertes Node.js aus.
 - **Kein Zwischenspeichern** – ein Neuladen zeigt immer den aktuellen Stand.
 - **Freier Port**: Ist der eingestellte belegt, nimmt der Server den nächsten.
 - **Browser öffnet sich** beim Start, unter Windows, macOS und Linux.
+- **HTTPS** auf Wunsch, mit einem Zertifikat der eigenen IT oder einem, das
+  der Server sich selbst ausstellt – ganz ohne OpenSSL.
 
 Nicht ausgeliefert werden `.sqlite`, `.db`, `.env`, `.ini` und `.htaccess` –
 auch dann nicht, wenn sie in `www/` liegen. PHP kann sie normal öffnen.
@@ -129,10 +133,11 @@ ordner      = www     # welcher Ordner ausgeliefert wird
 browser     = ja      # Browser beim Start öffnen
 netzwerk    = nein    # auch für andere Geräte im Netz erreichbar
 ordnerliste = ja      # Ordnerinhalt zeigen, wenn keine index.html da ist
+https       = nein    # verschlüsselt über https:// (siehe unten)
 ```
 
 Das Gleiche geht über die Befehlszeile (`--port`, `--ordner`, `--netzwerk`,
-`--kein-browser`, `--kein-listing`) und über die Umgebungsvariablen `PORT`,
+`--kein-browser`, `--kein-listing`, `--https`, `--zertifikat`) und über die Umgebungsvariablen `PORT`,
 `ORDNER`, `IM_NETZWERK`, `KEIN_BROWSER`. Die Befehlszeile hat Vorrang vor der
 Umgebung, diese vor der Einstellungsdatei.
 
@@ -143,6 +148,170 @@ Windows geht das ohne besondere Rechte, solange der Port frei ist – belegt ist
 er dort häufig durch IIS oder Skype. Unter macOS und Linux sind Ports unter
 1024 geschützt, dort braucht es `sudo node server.js`. In beiden Fällen sagt
 der Server beim Start, was zu tun ist.
+
+## Als Dienst auf einem Windows-Server
+
+Für den Dauerbetrieb: `Als Dienst einrichten.cmd` doppelklicken und die
+Abfrage nach Administratorrechten bestätigen. Danach
+
+- **startet der Server mit Windows**, auch ohne dass jemand angemeldet ist –
+  über eine Aufgabe „Lokaler Webserver“ in der Aufgabenplanung, die als
+  SYSTEM läuft,
+- **passt ein Wächter auf ihn auf** (`waechter.js`): Stürzt der Server ab,
+  startet er ihn neu. Alle 30 Sekunden fragt er unter `/_status` nach;
+  bleibt die Antwort zweimal aus, gilt der Server als hängend und wird
+  ebenfalls neu gestartet. Stürzt er gleich wieder ab, wartet der Wächter
+  jedes Mal doppelt so lange, höchstens eine Minute. Fällt der Wächter
+  selbst aus, startet ihn Windows nach einer Minute neu.
+- **zeigt ein Symbol in der Taskleiste** den Zustand – grün läuft, gelb
+  startet, rot gestört, grau aus. Bei einer Störung kommt eine
+  Benachrichtigung. Rechtsklick: im Browser öffnen, neu starten, Protokoll
+  anzeigen. Das Symbol startet bei jeder Anmeldung, für alle Benutzer.
+- **steht alles im Protokoll** `protokoll/server.log`, mit Uhrzeit. Ab 5 MB
+  wird es weitergeschoben, die letzten drei bleiben.
+- ist bei `netzwerk = ja` der Port in der **Windows-Firewall** freigegeben
+  (Domäne und privat).
+
+Unter dem Wächter bleibt der Server beim eingestellten Port, statt auf den
+nächsten freien auszuweichen – ein Proxy davor erwartet ihn dort. Wird
+`Webserver starten.vbs` doppelgeklickt, während der Dienst läuft, öffnet
+sich nur der Browser auf den laufenden Server.
+
+`/_status` antwortet mit `{"status":"ok", …}` und eignet sich auch als
+Gesundheitsprüfung für einen Proxy oder Load Balancer.
+
+Der Ordner sollte dafür nicht in einem Benutzerprofil liegen (Desktop,
+Dokumente), sondern zum Beispiel unter `C:\Webserver`.
+
+### Mehrere Webserver auf einem Rechner
+
+Jeder Ordner ist ein eigener Webserver. Mehrere laufen nebeneinander, wenn
+jeder in seiner `einstellungen.txt` einen eigenen Port hat:
+
+```
+C:\Webserver\Planer IT\    port = 8080   name = Planer IT
+C:\Webserver\Planer HR\    port = 8081   name = Planer HR
+```
+
+In jedem Ordner einmal `Als Dienst einrichten.cmd`. Alles hängt am Ordner:
+
+- die Aufgabe heißt `Lokaler Webserver - <name>` (ohne `name =` gilt der
+  Ordnername; gibt es den Namen schon für einen anderen Ordner, bricht die
+  Einrichtung mit einem Hinweis ab),
+- die Firewall-Regel gilt nur für den eigenen Port,
+- jeder bekommt sein eigenes Symbol in der Taskleiste,
+- `Webserver beenden.cmd` und `Dienst entfernen.cmd` treffen nur den Server
+  aus dem eigenen Ordner – erkannt am vollen Pfad von `server.js` bzw.
+  `waechter.js` in der Befehlszeile.
+
+Ist der Port beim Einrichten schon belegt, sagt die Einrichtung, von wem,
+und richtet nichts ein.
+
+## HTTPS
+
+```ini
+https = ja
+port  = 443
+```
+
+Damit läuft der Server unter `https://localhost`. Wer die `http://`-Adresse
+aufruft, wird auf `https://` umgeleitet – das erkennt der Server am ersten
+Byte der Verbindung, ein zweiter Port ist dafür nicht nötig. PHP sieht die
+Verschlüsselung wie gewohnt in `$_SERVER["HTTPS"]`.
+
+### Selbst erstelltes Zertifikat
+
+Ist nichts weiter eingestellt, legt der Server beim Start im Ordner
+`zertifikat/` eine kleine eigene Zertifizierungsstelle an und stellt sich
+damit ein Zertifikat aus. Erzeugt wird beides mit Node.js selbst, OpenSSL
+muss nicht installiert sein.
+
+| Datei | |
+| --- | --- |
+| `stammzertifikat.crt` | wird einmal auf den Geräten installiert, 10 Jahre gültig |
+| `stammzertifikat.key` | geheim, unterschreibt die Server-Zertifikate |
+| `server-<rechner>.crt`, `.key` | das Zertifikat des Servers, je Rechner, 800 Tage gültig |
+
+Das Server-Zertifikat enthält `localhost`, den Rechnernamen (in einer
+Windows-Domäne auch mit Domäne), alle IP-Adressen des Rechners und die
+Namen aus `namen = …`. Fehlt beim Start ein Name oder eine Adresse oder
+läuft es in weniger als 60 Tagen ab, stellt der Server ein neues aus. Weil
+das Stammzertifikat dabei bleibt, muss auf den Geräten nichts neu
+installiert werden.
+
+Bis das Stammzertifikat installiert ist, warnt der Browser. Installieren:
+
+- **Windows:** `stammzertifikat.crt` doppelklicken → *Zertifikat
+  installieren* → *Lokaler Computer* → *Vertrauenswürdige
+  Stammzertifizierungsstellen*. In einer Domäne kann die IT das per
+  Gruppenrichtlinie verteilen.
+- **iPad, iPhone:** In Safari `https://<Server>/_zertifikat` öffnen, Profil
+  laden und installieren, dann unter *Allgemein → Info →
+  Zertifikatsvertrauenseinstellungen* einschalten.
+
+Unter `/_zertifikat` liefert der Server nur das Stammzertifikat aus, nie
+einen Schlüssel. Dateien mit `.key`, `.pem`, `.pfx` und `.p12` gibt er auch
+aus `www/` heraus nicht ab.
+
+### Zertifikat der eigenen IT
+
+In einer Firma ist ein Zertifikat der internen Zertifizierungsstelle der
+bessere Weg – dem vertrauen die Geräte der Domäne schon, kein Browser
+warnt.
+
+```ini
+zertifikat          = zertifikat/server.pfx
+zertifikat-passwort = …
+```
+
+Statt einer `.pfx` geht auch eine `.crt` (gern mit Zwischenzertifikaten)
+mit einer gleichnamigen `.key` daneben. Passt das Passwort nicht oder fehlt
+eine Datei, sagt der Server das beim Start und beendet sich.
+
+## Sicherheit
+
+Was der Server von sich aus abwehrt:
+
+- **Nichts außerhalb von `www/`**, auch nicht über `..`, kodierte Varianten
+  oder Umwege.
+- **Kein PHP-Quelltext über Windows-Eigenheiten.** Windows öffnet
+  `seite.php::$DATA`, `seite.php.` und `seite.php ` als `seite.php` – nur
+  endet der Name dann nicht mehr auf `.php`, und der Quelltext käme als Text
+  heraus. Solche Adressen (Doppelpunkt, Punkt oder Leerzeichen am Ende)
+  werden abgewiesen. Über Endung und Schutz entscheidet außerdem der echte
+  Dateiname, damit auch Kurznamen wie `DATENB~1.SQL` nichts verraten.
+- **Geschützte Dateien:** Datenbanken, `.env`, `.ini`, Schlüssel und
+  Zertifikatsdateien, Sicherungskopien (`.bak`, `.old`, `.orig`, `.swp`,
+  `.save`, `datei~`), Protokolle (`.log`) und alles, was mit einem Punkt
+  beginnt (`.git/`, `.htpasswd`). Sie fehlen auch in der Ordnerliste.
+- **httpoxy:** Die Kopfzeile `Proxy` wird nicht an PHP weitergereicht – sonst
+  nähmen viele PHP-Bibliotheken sie als Proxy für ihre eigenen Verbindungen.
+- **PHP-Fehlermeldungen** zeigt der Browser nur auf dem Rechner selbst, von
+  anderswo kommt eine allgemeine Meldung. Die Einzelheiten stehen im
+  Protokoll.
+- **Ungültige Kopfzeilen von PHP** führen zu einer Fehlerseite statt zum
+  Absturz des Servers.
+- **Kopfzeilen** `X-Content-Type-Options: nosniff` und
+  `Referrer-Policy: same-origin` bei jeder Antwort.
+- **Als Dienst** läuft der Server unter dem Konto *Lokaler Dienst*, das nur
+  in seinem eigenen Ordner schreiben darf – nicht als SYSTEM. Braucht die
+  Anwendung Schreibrechte außerhalb davon: `dienstkonto = system`.
+
+Was auf einem Server zusätzlich gehört:
+
+- **PHP aktuell halten** – die Startmeldung zeigt die Version; mit der auf
+  [php.net](https://www.php.net/downloads.php?os=windows) vergleichen. Beim
+  Austausch die eigene `php.ini` in den neuen Ordner mitnehmen.
+- **`ordnerliste = nein`**, damit niemand den Inhalt von Ordnern sieht.
+- **`test.php` und `beispiel.php` löschen** – jeder im Netz könnte sie
+  aufrufen, `beispiel.php` auch Einträge löschen.
+- **Eine `php.ini`, die schon da ist, ändert der Server nie.** Eine neu
+  angelegte enthält bereits `display_errors = Off`, `expose_php = Off`,
+  sichere Sitzungs-Cookies und `session.upload_progress.enabled = 0`; in
+  einer älteren diese Zeilen von Hand ergänzen.
+- Der Server selbst kennt **keine Anmeldung**. Wer ihn erreicht, sieht alles
+  in `www/` – die Anwendung muss sich selbst darum kümmern, oder der Proxy
+  davor.
 
 ## PHP einrichten
 
@@ -163,6 +332,9 @@ Startmeldung zeigt, welches PHP gefunden wurde und ob SQLite bereitsteht.
 ```
 lokaler-webserver/
 ├── server.js                          der Server
+├── waechter.js                        startet und überwacht den Server
+├── dienst/                            Einrichtung als Dienst, Taskleisten-Symbol
+├── protokoll/                         Protokoll und Zustand, legt der Wächter an
 ├── node.exe                           ~80 MB, nur mitgelegt
 ├── php/                               nur nötig für PHP
 ├── www/                               die eigenen Seiten
@@ -171,14 +343,17 @@ lokaler-webserver/
 │   ├── beispiel.php                   gemeinsame Liste, darf weg
 │   └── lib/speicher.php               Datensätze für den Sync-Ordner
 ├── daten/                             Datenbanken und JSON-Dateien
+├── zertifikat/                        nur bei https, legt der Server an
 ├── einstellungen.txt                  legt der Server selbst an
 ├── Anleitung.html                     bebilderte Anleitung, per Doppelklick
 ├── Webserver starten.vbs
 ├── Webserver mit Fenster starten.cmd
 ├── Webserver beenden.cmd
 ├── Webserver starten.command
+├── Als Dienst einrichten.cmd
+├── Dienst entfernen.cmd
 └── LIESMICH.txt
 ```
 
-`node.exe`, `php/` und `daten/` liegen nicht im Repository – zu groß
+`node.exe`, `php/`, `daten/`, `zertifikat/` und `protokoll/` liegen nicht im Repository – zu groß
 beziehungsweise inhaltlich nichts, was versioniert gehört.
