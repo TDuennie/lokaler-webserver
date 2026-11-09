@@ -268,6 +268,51 @@ Statt einer `.pfx` geht auch eine `.crt` (gern mit Zwischenzertifikaten)
 mit einer gleichnamigen `.key` daneben. Passt das Passwort nicht oder fehlt
 eine Datei, sagt der Server das beim Start und beendet sich.
 
+## Sicherheit
+
+Was der Server von sich aus abwehrt:
+
+- **Nichts außerhalb von `www/`**, auch nicht über `..`, kodierte Varianten
+  oder Umwege.
+- **Kein PHP-Quelltext über Windows-Eigenheiten.** Windows öffnet
+  `seite.php::$DATA`, `seite.php.` und `seite.php ` als `seite.php` – nur
+  endet der Name dann nicht mehr auf `.php`, und der Quelltext käme als Text
+  heraus. Solche Adressen (Doppelpunkt, Punkt oder Leerzeichen am Ende)
+  werden abgewiesen. Über Endung und Schutz entscheidet außerdem der echte
+  Dateiname, damit auch Kurznamen wie `DATENB~1.SQL` nichts verraten.
+- **Geschützte Dateien:** Datenbanken, `.env`, `.ini`, Schlüssel und
+  Zertifikatsdateien, Sicherungskopien (`.bak`, `.old`, `.orig`, `.swp`,
+  `.save`, `datei~`), Protokolle (`.log`) und alles, was mit einem Punkt
+  beginnt (`.git/`, `.htpasswd`). Sie fehlen auch in der Ordnerliste.
+- **httpoxy:** Die Kopfzeile `Proxy` wird nicht an PHP weitergereicht – sonst
+  nähmen viele PHP-Bibliotheken sie als Proxy für ihre eigenen Verbindungen.
+- **PHP-Fehlermeldungen** zeigt der Browser nur auf dem Rechner selbst, von
+  anderswo kommt eine allgemeine Meldung. Die Einzelheiten stehen im
+  Protokoll.
+- **Ungültige Kopfzeilen von PHP** führen zu einer Fehlerseite statt zum
+  Absturz des Servers.
+- **Kopfzeilen** `X-Content-Type-Options: nosniff` und
+  `Referrer-Policy: same-origin` bei jeder Antwort.
+- **Als Dienst** läuft der Server unter dem Konto *Lokaler Dienst*, das nur
+  in seinem eigenen Ordner schreiben darf – nicht als SYSTEM. Braucht die
+  Anwendung Schreibrechte außerhalb davon: `dienstkonto = system`.
+
+Was auf einem Server zusätzlich gehört:
+
+- **PHP aktuell halten** – die Startmeldung zeigt die Version; mit der auf
+  [php.net](https://www.php.net/downloads.php?os=windows) vergleichen. Beim
+  Austausch die eigene `php.ini` in den neuen Ordner mitnehmen.
+- **`ordnerliste = nein`**, damit niemand den Inhalt von Ordnern sieht.
+- **`test.php` und `beispiel.php` löschen** – jeder im Netz könnte sie
+  aufrufen, `beispiel.php` auch Einträge löschen.
+- **Eine `php.ini`, die schon da ist, ändert der Server nie.** Eine neu
+  angelegte enthält bereits `display_errors = Off`, `expose_php = Off`,
+  sichere Sitzungs-Cookies und `session.upload_progress.enabled = 0`; in
+  einer älteren diese Zeilen von Hand ergänzen.
+- Der Server selbst kennt **keine Anmeldung**. Wer ihn erreicht, sieht alles
+  in `www/` – die Anwendung muss sich selbst darum kümmern, oder der Proxy
+  davor.
+
 ## PHP einrichten
 
 1. Auf [windows.php.net/download](https://windows.php.net/download) die

@@ -749,8 +749,26 @@ const PHP_INI_INHALT = [
     "extension=zip",
     "extension=exif",
     "",
-    "display_errors = On",
+    "; Fehlermeldungen nicht im Browser zeigen - sie verraten Pfade und",
+    "; Code. Sie landen stattdessen im Protokoll des Servers. Zum",
+    "; Entwickeln auf dem eigenen Rechner darf hier On stehen.",
+    "display_errors = Off",
+    "log_errors = On",
     "error_reporting = E_ALL",
+    "",
+    "; Die PHP-Version nicht in jeder Antwort verraten",
+    "expose_php = Off",
+    "",
+    "; Sitzungen: Cookie nicht fuer JavaScript lesbar, nicht an fremde",
+    "; Seiten mitgeschickt, und nur vom Server vergebene Kennungen",
+    "session.cookie_httponly = 1",
+    "session.cookie_samesite = Lax",
+    "session.use_strict_mode = 1",
+    "session.use_only_cookies = 1",
+    "",
+    "; Wird nicht gebraucht und war schon Einfallstor fuer Angriffe",
+    "session.upload_progress.enabled = 0",
+    "allow_url_include = Off",
     "",
     "upload_max_filesize = 64M",
     "post_max_size = 64M",
@@ -909,17 +927,39 @@ function groesseAnzeigen(bytes) {
 // Dateien, die zwar im Ordner liegen duerfen, aber nicht ueber den
 // Browser abrufbar sein sollen - allen voran die SQLite-Datenbank.
 const GESCHUETZT = [".sqlite", ".sqlite3", ".db", ".db3", ".env", ".ini", ".htaccess",
-                    ".key", ".pem", ".pfx", ".p12"];
+                    ".key", ".pem", ".pfx", ".p12",
+                    // Sicherungskopien wuerden PHP-Quelltext als Text ausliefern
+                    ".bak", ".old", ".orig", ".save", ".swp", ".log"];
 
 function istGeschuetzt(datei) {
 
     const name = path.basename(datei).toLowerCase();
 
-    if (name === ".env" || name === ".htaccess") {
+    // Versteckte Dateien wie .env, .htpasswd, .gitignore - und "datei.php~"
+    if (name.startsWith(".") || name.endsWith("~")) {
         return true;
     }
 
     return GESCHUETZT.indexOf(path.extname(name)) >= 0;
+}
+
+// Pfade, die nie ausgeliefert werden - egal, was darin liegt:
+//
+//  - Ordner, deren Name mit einem Punkt beginnt (.git, .vscode, ...)
+//  - Doppelpunkte: unter Windows oeffnet "seite.php::$DATA" dieselbe Datei
+//    wie "seite.php", nur endet der Name dann nicht mehr auf ".php" - der
+//    Quelltext kaeme als Text heraus
+//  - Namen mit Punkt oder Leerzeichen am Ende: Windows schneidet beides
+//    stillschweigend ab, "seite.php." waere also ebenfalls der Quelltext
+function istUnzulaessigerPfad(urlPfad) {
+
+    if (urlPfad.indexOf(":") >= 0 || urlPfad.indexOf("\0") >= 0) {
+        return true;
+    }
+
+    return urlPfad.split("/").some(function (teil) {
+        return teil.startsWith(".") || / $|\.$/.test(teil);
+    });
 }
 
 // Dateien, die Sync-Dienste und Betriebssysteme anlegen
@@ -946,6 +986,7 @@ async function verzeichnisAnzeigen(antwort, ordner, urlPfad) {
         (await fsp.readdir(ordner, { withFileTypes: true }))
             .filter(function (eintrag) {
                 return !istMuell(eintrag.name) &&
+                       !eintrag.name.startsWith(".") &&
                        (eintrag.isDirectory() || !istGeschuetzt(eintrag.name));
             })
             .sort(function (a, b) {
@@ -1005,7 +1046,7 @@ async function verzeichnisAnzeigen(antwort, ordner, urlPfad) {
         "</style>" +
         "<h1>" + entschaerfen(decodeURIComponent(urlPfad)) + "</h1>" +
         "<ul>" + (zeilen.join("") || "<li class=\"d\"><span>Der Ordner ist leer.</span></li>") + "</ul>" +
-        "<footer>Lokaler Webserver &middot; " + entschaerfen(WURZEL) + "</footer>";
+        "<footer>Lokaler Webserver</footer>";
 
     antwort.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
@@ -1016,6 +1057,13 @@ async function verzeichnisAnzeigen(antwort, ordner, urlPfad) {
 }
 
 /* ===== PHP ausfuehren ===== */
+
+function istLokal(anfrage) {
+
+    const adresse = anfrage.socket.remoteAddress || "";
+
+    return adresse === "127.0.0.1" || adresse === "::1" || adresse === "::ffff:127.0.0.1";
+}
 
 function phpAusfuehren(anfrage, antwort, datei, urlPfad, abfrage) {
 
@@ -1052,8 +1100,15 @@ function phpAusfuehren(anfrage, antwort, datei, urlPfad, abfrage) {
         umgebung.HTTPS = "on";
     }
 
-    // Alle uebrigen Kopfzeilen der Anfrage weiterreichen
+    // Alle uebrigen Kopfzeilen der Anfrage weiterreichen - ausser "Proxy":
+    // Daraus wuerde HTTP_PROXY, und viele PHP-Bibliotheken nehmen das als
+    // Proxy fuer ihre eigenen Verbindungen ("httpoxy"). Ein Angreifer
+    // koennte so ausgehende Anfragen samt Zugangsdaten umleiten.
     for (const [name, wert] of Object.entries(anfrage.headers)) {
+
+        if (name.toLowerCase() === "proxy") {
+            continue;
+        }
 
         const schluessel =
             "HTTP_" + name.toUpperCase().replace(/-/g, "_");
@@ -1113,8 +1168,14 @@ function phpAusfuehren(anfrage, antwort, datei, urlPfad, abfrage) {
         if (trenner < 0) {
 
             if (ausgabe.length === 0 && fehlertext) {
+
+                // Die Meldung verraet Pfade und Code - im Browser nur auf
+                // dem Rechner selbst, sonst steht sie im Protokoll
                 fehlerSeite(antwort, 500, "Fehler in PHP",
-                            "<code>" + entschaerfen(fehlertext) + "</code>");
+                            istLokal(anfrage)
+                                ? "<code>" + entschaerfen(fehlertext) + "</code>"
+                                : "Die Seite konnte nicht erzeugt werden. Die Einzelheiten " +
+                                  "stehen im Protokoll des Servers.");
                 return;
             }
 
@@ -1166,7 +1227,18 @@ function phpAusfuehren(anfrage, antwort, datei, urlPfad, abfrage) {
 
         kopfzeilen["Cache-Control"] = "no-store";
 
-        antwort.writeHead(status, kopfzeilen);
+        // Schickt PHP eine Kopfzeile mit unzulaessigen Zeichen (etwa einen
+        // Umlaut in Content-Disposition), wirft Node hier - ohne dieses
+        // try wuerde das den ganzen Server beenden
+        try {
+            antwort.writeHead(status, kopfzeilen);
+        } catch (fehler) {
+            console.error("  PHP hat eine ungueltige Kopfzeile geschickt: " + fehler.message);
+            fehlerSeite(antwort, 500, "Fehler in PHP",
+                        "Die Seite hat eine ungueltige Kopfzeile geschickt.");
+            return;
+        }
+
         antwort.end(inhalt);
     });
 }
@@ -1271,6 +1343,12 @@ async function beantworten(anfrage, antwort) {
         return;
     }
 
+    if (istUnzulaessigerPfad(urlPfad)) {
+        fehlerSeite(antwort, 404, "Nicht gefunden",
+                    "<code>" + entschaerfen(urlPfad) + "</code> gibt es hier nicht.");
+        return;
+    }
+
     const ziel = path.resolve(WURZEL, "." + urlPfad);
 
     // Nichts ausserhalb des Ordners ausliefern
@@ -1304,7 +1382,11 @@ async function beantworten(anfrage, antwort) {
 
         // Ohne Schrägstrich am Ende zeigen relative Verweise ins Leere
         if (!urlPfad.endsWith("/")) {
-            antwort.writeHead(301, { "Location": encodeURI(urlPfad + "/") + zerlegt.search });
+            // Fuehrende Schraegstriche zusammenfassen: "//ziel/" waere fuer den
+            // Browser eine Adresse auf einem anderen Rechner
+            antwort.writeHead(301, {
+                "Location": encodeURI(urlPfad.replace(/^\/+/, "/") + "/") + zerlegt.search
+            });
             antwort.end();
             return;
         }
@@ -1336,7 +1418,24 @@ async function beantworten(anfrage, antwort) {
         return;
     }
 
-    if (path.extname(ziel).toLowerCase() === ".php") {
+    // Ueber den echten Namen der Datei entscheiden, nicht ueber den
+    // angefragten: Windows oeffnet "SEITE~1.PHP" oder "DATENB~1.SQL" als
+    // Kurznamen von "seite.php" bzw. "datenbank.sqlite"
+    let echt = ziel;
+
+    try {
+        echt = await fsp.realpath(ziel);
+    } catch (fehler) {
+        // Dann eben der angefragte
+    }
+
+    if (istGeschuetzt(echt)) {
+        fehlerSeite(antwort, 403, "Kein Zugriff",
+                    "Diese Datei wird nicht ausgeliefert.");
+        return;
+    }
+
+    if (path.extname(echt).toLowerCase() === ".php" || path.extname(ziel).toLowerCase() === ".php") {
 
         if (!PHP) {
             phpFehlt(antwort);
@@ -1367,6 +1466,13 @@ const GESTARTET = new Date().toISOString();
 function anfrageBearbeiten(anfrage, antwort) {
 
     const beginn = Date.now();
+
+    // Fuer jede Antwort, auch die von PHP: Der Browser soll den Dateityp
+    // nicht raten (sonst wird aus einer hochgeladenen .txt womoeglich
+    // ausfuehrbares HTML), und Adressen samt Parametern sollen nicht an
+    // fremde Seiten weitergegeben werden.
+    antwort.setHeader("X-Content-Type-Options", "nosniff");
+    antwort.setHeader("Referrer-Policy", "same-origin");
 
     // Lebenszeichen fuer den Waechter und den Proxy der IT
     if (anfrage.url === STATUS_PFAD) {

@@ -32,6 +32,9 @@ Get-NetFirewallRule -ErrorAction SilentlyContinue |
     Remove-NetFirewallRule
 Write-Host "  Firewall-Freigabe entfernt."
 
+# Die beim Einrichten vergebenen Rechte fuer "Lokaler Dienst" zuruecknehmen
+& icacls.exe $Ordner /remove:g "*S-1-5-19" /Q | Out-Null
+
 Remove-Item $Verknuepfung -ErrorAction SilentlyContinue
 
 $symbolSkript = (Join-Path $PSScriptRoot "taskleiste.ps1").ToLowerInvariant()

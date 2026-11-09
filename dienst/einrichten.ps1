@@ -126,7 +126,32 @@ $einstellungen = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew
 
-$konto = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+# Unter welchem Konto der Server laeuft. Standard ist "Lokaler Dienst":
+# Es darf nur in diesem Ordner schreiben und sonst kaum etwas. Findet
+# jemand eine Luecke im Planer oder in PHP, steckt er dort fest statt mit
+# vollen Rechten auf dem ganzen Rechner. Nur wenn die Anwendung ausserhalb
+# dieses Ordners schreiben muss: "dienstkonto = system" in einstellungen.txt.
+#
+# Angegeben als SID - die Namen sind je nach Sprache von Windows verschieden
+# ("LOKALER DIENST", "LOCAL SERVICE").
+$systemKonto = (Get-Einstellung "dienstkonto" "").ToLower() -eq "system"
+
+if ($systemKonto) {
+    $konto = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
+    $kontoName = "SYSTEM (volle Rechte)"
+} else {
+    $konto = New-ScheduledTaskPrincipal -UserId "S-1-5-19" -LogonType ServiceAccount -RunLevel Limited
+    $kontoName = "Lokaler Dienst (eingeschraenkt)"
+
+    # Lesen und Schreiben in diesem Ordner - fuer Daten, Protokoll,
+    # Zertifikat und die php.ini, die der Server beim ersten Start anlegt
+    & icacls.exe $Ordner /grant "*S-1-5-19:(OI)(CI)M" /Q | Out-Null
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  Die Rechte fuer 'Lokaler Dienst' liessen sich nicht setzen."
+        exit 1
+    }
+}
 
 Register-ScheduledTask -TaskName $Aufgabe `
                        -Description "Startet den lokalen Webserver aus $Ordner mit Windows und passt auf ihn auf." `
@@ -135,6 +160,7 @@ Register-ScheduledTask -TaskName $Aufgabe `
 
 Write-Host ""
 Write-Host "  Aufgabe '$Aufgabe' eingerichtet - startet mit Windows."
+Write-Host "  Laeuft als: $kontoName"
 
 # --- Windows-Firewall -------------------------------------------------
 
